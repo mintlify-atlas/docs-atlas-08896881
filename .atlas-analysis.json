@@ -1,0 +1,126 @@
+{
+  "projectType": "sdk-library",
+  "projectName": "wayland-rs",
+  "projectDescription": "A collection of Rust crates providing client-side and server-side bindings for the Wayland display protocol, from low-level FFI to high-level typed APIs.",
+  "theme": "maple",
+  "primaryColor": "#a16d54",
+  "lightColor": "#18130f",
+  "darkColor": "#d3d3d3",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Guide",
+        "groups": [
+          {
+            "group": "Introduction",
+            "pages": [
+              "introduction",
+              "architecture"
+            ]
+          },
+          {
+            "group": "Client Development",
+            "pages": [
+              "client/quickstart",
+              "client/connection",
+              "client/event-queues",
+              "client/globals",
+              "client/dispatch"
+            ]
+          },
+          {
+            "group": "Server Development",
+            "pages": [
+              "server/quickstart",
+              "server/display",
+              "server/globals",
+              "server/dispatch",
+              "server/clients"
+            ]
+          },
+          {
+            "group": "Protocol Extensions",
+            "pages": [
+              "protocols/overview",
+              "protocols/xdg",
+              "protocols/wlr",
+              "protocols/plasma",
+              "protocols/custom"
+            ]
+          },
+          {
+            "group": "Utilities & Integration",
+            "pages": [
+              "utilities/cursor",
+              "utilities/egl",
+              "utilities/backends",
+              "utilities/ffi"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "Crate Reference",
+        "groups": [
+          {
+            "group": "Core Crates",
+            "pages": [
+              "reference/wayland-client",
+              "reference/wayland-server",
+              "reference/wayland-protocols"
+            ]
+          },
+          {
+            "group": "Supporting Crates",
+            "pages": [
+              "reference/wayland-backend",
+              "reference/wayland-scanner",
+              "reference/wayland-cursor",
+              "reference/wayland-egl",
+              "reference/wayland-sys"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "Pure-Rust implementation of the Wayland wire protocol (no libwayland required)",
+    "Optional system backend using libwayland-client/server via FFI",
+    "Type-safe, generated Rust bindings from Wayland XML protocol specs",
+    "High-level client API: Connection, EventQueue, Dispatch trait",
+    "High-level server API: Display, GlobalDispatch, Resource trait",
+    "Pre-generated bindings for all official Wayland protocol extensions (xdg, wp, ext)",
+    "Bindings for wlroots, KDE Plasma, and experimental protocol extensions",
+    "OpenGL/EGL integration via wayland-egl",
+    "Cursor theme loading via wayland-cursor",
+    "Procedural macro code generator (wayland-scanner) for custom protocols",
+    "Dynamic loading (dlopen) support for graceful fallback when libwayland is absent"
+  ],
+  "publicApiSurface": [
+    "wayland_client::Connection",
+    "wayland_client::EventQueue",
+    "wayland_client::Dispatch",
+    "wayland_client::QueueHandle",
+    "wayland_client::globals::GlobalList",
+    "wayland_client::protocol (auto-generated core protocol types)",
+    "wayland_server::Display",
+    "wayland_server::DisplayHandle",
+    "wayland_server::Resource (trait)",
+    "wayland_server::GlobalDispatch (trait)",
+    "wayland_server::Client",
+    "wayland_server::ListeningSocket",
+    "wayland_backend::client::Backend",
+    "wayland_backend::server::Backend",
+    "wayland_scanner::generate_interfaces!",
+    "wayland_scanner::generate_client_code!",
+    "wayland_scanner::generate_server_code!",
+    "wayland_cursor::CursorTheme",
+    "wayland_egl::WlEglSurface",
+    "wayland_protocols::xdg",
+    "wayland_protocols::wp",
+    "wayland_protocols::ext",
+    "wayland_protocols_wlr",
+    "wayland_protocols_plasma"
+  ]
+}

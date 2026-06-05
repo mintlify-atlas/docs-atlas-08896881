@@ -1,0 +1,232 @@
+---
+title: "Architecture of the wayland-rs crate stack"
+sidebarTitle: "Architecture"
+description: "Learn how wayland-rs organizes its 12 crates from raw FFI at the bottom to high-level typed protocol bindings at the top."
+---
+
+wayland-rs is not a single crate — it is a carefully layered workspace of 12 crates, each with a precisely scoped responsibility. Understanding how those layers fit together helps you choose the right crates for your project, reason about compile-time features, and perform FFI integration confidently. This page walks through every layer from the raw C bindings at the bottom to the typed, ergonomic protocol objects at the top.
+
+## Three-layer architecture
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                         LAYER 3 — High-level                            │
+│                                                                         │
+│  wayland-client   wayland-server   wayland-protocols   wayland-cursor   │
+│                                    wayland-protocols-wlr  wayland-egl   │
+│                                    wayland-protocols-plasma  …          │
+├─────────────────────────────────────────────────────────────────────────┤
+│                         LAYER 2 — Backend                               │
+│                                                                         │
+│           wayland-backend  ──────────  wayland-scanner                  │
+│          (rs module | sys module)      (proc-macro codegen)             │
+├─────────────────────────────────────────────────────────────────────────┤
+│                         LAYER 1 — FFI                                   │
+│                                                                         │
+│                           wayland-sys                                   │
+│             (raw unsafe FFI to libwayland-*.so)                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+Each layer depends only on the layers below it. Application and compositor code live entirely in Layer 3, which means they are insulated from the raw FFI and backend machinery unless they deliberately opt in.
+
+## Layer 1 — FFI: `wayland-sys`
+
+`wayland-sys` is the lowest crate in the stack. It contains raw, `unsafe` Rust FFI declarations generated from the C headers of:
+
+- `libwayland-client.so`
+- `libwayland-server.so`
+- `libwayland-cursor.so`
+- `libwayland-egl.so`
+
+Each library's bindings are guarded by a corresponding Cargo feature (`client`, `server`, `cursor`, `egl`), so you only link what you use. The crate is not intended for direct use in application code — its sole purpose is to give `wayland-backend`'s `sys` module a well-typed surface to call into.
+
+The optional `dlopen` feature changes the linking strategy from static linkage (`.so` baked into the ELF `NEEDED` entries at link time) to runtime dynamic loading (`dlopen(3)`). This means the binary starts successfully even when `libwayland-*.so` is absent, enabling graceful fallback to X11 or other display servers.
+
+```toml
+# wayland-sys is almost never added directly — use it only for raw FFI work
+[dependencies]
+wayland-sys = { version = "0.31", features = ["client", "dlopen"] }
+```
+
+## Layer 2 — Backend: `wayland-backend` and `wayland-scanner`
+
+### `wayland-backend` — the protocol engine
+
+`wayland-backend` is the heart of the entire workspace. It implements the Wayland wire protocol — object lifecycle, message serialization, file-descriptor passing, and event dispatch — and exposes a stable Rust API that the high-level crates build on. It ships **two protocol engines** behind a common API surface:
+
+<Tabs>
+  <Tab title="rs module — pure Rust">
+    `wayland_backend::rs` is a complete, dependency-free Rust reimplementation of the Wayland protocol. It is **always compiled** regardless of Cargo features. The `rs` backend is the default: if no `*_system` feature is enabled, the top-level re-exports (`wayland_backend::client` and `wayland_backend::server`) resolve to this module.
+
+    ```rust
+    // When no system feature is enabled, these resolve to the rs backend:
+    use wayland_backend::client::Backend;
+    use wayland_backend::server::Handle;
+    ```
+
+    Because `rs` carries no native library dependency, binaries built against it are fully self-contained and portable.
+  </Tab>
+  <Tab title="sys module — C bindings">
+    `wayland_backend::sys` delegates to `libwayland-client.so` and `libwayland-server.so` via `wayland-sys`. It is compiled only when the `client_system` or `server_system` Cargo features are enabled. In addition to the full shared API, the `sys` module exposes **FFI-specific functions** for retrieving raw `wl_display*`, `wl_client*`, and `wl_resource*` pointers — the entry points for interoperating with C code.
+
+    ```toml
+    # Enable the system backend for the client side
+    [dependencies]
+    wayland-backend = { version = "0.3", features = ["client_system"] }
+    ```
+  </Tab>
+</Tabs>
+
+### Transparent backend selection via re-exports
+
+The `wayland_backend::client` and `wayland_backend::server` top-level modules are **conditional re-exports** that automatically resolve to whichever backend is active:
+
+```rust
+// From wayland-backend/src/lib.rs — simplified
+#[cfg(not(feature = "client_system"))]
+pub use rs::client;       // pure-Rust backend
+#[cfg(feature = "client_system")]
+pub use sys::client;      // C-library backend
+
+#[cfg(not(feature = "server_system"))]
+pub use rs::server;
+#[cfg(feature = "server_system")]
+pub use sys::server;
+```
+
+This design has an important consequence: **library crates should never hard-code which backend they use**. By importing from `wayland_backend::client` (rather than `wayland_backend::rs::client` or `wayland_backend::sys::client`), a library automatically inherits whatever backend the application's final dependency graph selects. If any crate in the build enables `client_system`, every crate transparently switches to the `sys` backend with no code changes.
+
+### `wayland-scanner` — XML → Rust code generation
+
+The Wayland protocol and all its extensions are formally described in XML files. `wayland-scanner` is a procedural-macro crate that reads those XML files **at compile time** and generates the corresponding Rust types, trait implementations, and interface metadata.
+
+It provides three macros:
+
+| Macro | Purpose |
+|---|---|
+| `generate_interfaces!` | Generates low-level `wl_interface` structs needed by the backend |
+| `generate_client_code!` | Generates typed client-side proxy types and event enums |
+| `generate_server_code!` | Generates typed server-side resource types and request enums |
+
+A typical custom protocol module looks like this:
+
+```rust
+pub mod my_protocol {
+    use wayland_client;
+    // Import core protocol objects if your protocol extends them
+    use wayland_client::protocol::*;
+
+    pub mod __interfaces {
+        use wayland_client::protocol::__interfaces::*;
+        // Step 1: generate low-level interface metadata from the XML
+        wayland_scanner::generate_interfaces!("./protocols/my-protocol.xml");
+    }
+    use self::__interfaces::*;
+
+    // Step 2: generate client-side proxy types (requests + events)
+    wayland_scanner::generate_client_code!("./protocols/my-protocol.xml");
+}
+```
+
+For server-side code, replace `generate_client_code!` with `generate_server_code!`. The path argument is relative to the crate root (`CARGO_MANIFEST_DIR`).
+
+<Note>
+  Before writing your own XML bindings, check whether the protocol you need is already available in `wayland-protocols`, `wayland-protocols-wlr`, `wayland-protocols-plasma`, or `wayland-protocols-misc`. Those crates use `wayland-scanner` internally and are kept up to date with the upstream repositories.
+</Note>
+
+## Layer 3 — High-level: client, server, and protocol crates
+
+These are the crates that applications and compositors interact with directly.
+
+### `wayland-client`
+
+`wayland-client` wraps `wayland-backend::client` and adds:
+
+- A strongly-typed `Connection` and `EventQueue` for driving the Wayland event loop.
+- `Proxy` trait implementations for every core Wayland object (`wl_surface`, `wl_seat`, `wl_output`, …).
+- The `Dispatch` trait, which you implement on your state type to receive events.
+
+Enabling the `system` feature on `wayland-client` propagates `client_system` to `wayland-backend`, switching the whole stack to the C-library backend:
+
+```toml
+[dependencies]
+wayland-client = { version = "0.31", features = ["system"] }
+```
+
+### `wayland-server`
+
+`wayland-server` mirrors `wayland-client` for the compositor side:
+
+- `Display` and `ListeningSocket` for accepting client connections.
+- `Resource` trait implementations for every core server-side Wayland object.
+- The `Dispatch` trait for handling incoming requests from clients.
+
+```toml
+[dependencies]
+wayland-server = { version = "0.31", features = ["system"] }  # optional system backend
+```
+
+### `wayland-protocols` and the extension crates
+
+`wayland-protocols` runs `wayland-scanner` over the entire [upstream wayland-protocols repository](https://gitlab.freedesktop.org/wayland/wayland-protocols) at build time and exposes the results under a clean module hierarchy. Features control which sets are compiled:
+
+- `client` / `server` — generate client-side or server-side bindings (at least one is required).
+- `staging` — include protocols in the staging pipeline.
+- `unstable` — include not-yet-stabilised protocol drafts.
+
+Specialist extension sets live in sibling crates that follow the same pattern:
+
+```toml
+[dependencies]
+wayland-protocols      = { version = "0.32", features = ["client", "staging"] }
+wayland-protocols-wlr  = { version = "0.3",  features = ["client"] }
+```
+
+### `wayland-cursor` and `wayland-egl`
+
+These two auxiliary crates wrap specific `libwayland-cursor.so` and `libwayland-egl.so` functionality (via `wayland-sys`) and expose safe Rust APIs:
+
+- **`wayland-cursor`**: load cursor images from XCursor themes, upload pixels into `WlBuffer`s, and retrieve frame timing for animated cursors.
+- **`wayland-egl`**: create an `EGLSurface` from a `WlSurface` for OpenGL or Vulkan rendering.
+
+## Crate dependency table
+
+The table below captures the direct dependency relationships across the workspace.
+
+| Crate | Depends on |
+|---|---|
+| `wayland-sys` | *(system libraries only — no Rust crate deps)* |
+| `wayland-scanner` | *(proc-macro only — no runtime deps)* |
+| `wayland-backend` | `wayland-sys` (optional, via `*_system` features) |
+| `wayland-client` | `wayland-backend`, `wayland-scanner` |
+| `wayland-server` | `wayland-backend`, `wayland-scanner` |
+| `wayland-protocols` | `wayland-client` and/or `wayland-server`, `wayland-scanner` |
+| `wayland-protocols-wlr` | `wayland-client` and/or `wayland-server`, `wayland-scanner` |
+| `wayland-protocols-plasma` | `wayland-client` and/or `wayland-server`, `wayland-scanner` |
+| `wayland-cursor` | `wayland-client`, `wayland-sys` |
+| `wayland-egl` | `wayland-client`, `wayland-sys` |
+
+## Feature propagation in practice
+
+Because Cargo unifies features across the entire dependency graph, enabling a single feature in any crate can propagate backend selection throughout the whole build. Here is a concrete example:
+
+<Steps>
+  <Step title="Application enables system backend">
+    Your application adds `wayland-client = { features = ["system"] }` to its `Cargo.toml`.
+  </Step>
+  <Step title="Feature flag propagates to wayland-backend">
+    `wayland-client`'s `system` feature enables `wayland-backend/client_system`.
+  </Step>
+  <Step title="wayland-backend activates wayland-sys">
+    `client_system` pulls in `wayland-sys` with the `client` feature, which links `libwayland-client.so`.
+  </Step>
+  <Step title="Re-export switches to sys backend">
+    `wayland_backend::client` now resolves to `wayland_backend::sys::client` instead of `wayland_backend::rs::client`.
+  </Step>
+  <Step title="All library crates upgrade automatically">
+    Any library crate in the dependency tree that imports `wayland_backend::client` now also uses the `sys` backend — without any code change on the library author's part.
+  </Step>
+</Steps>
+
+This propagation is intentional and the reason the re-export pattern exists. Library crate authors should always import from the top-level `wayland_backend::client` / `wayland_backend::server` rather than from `rs::` or `sys::` directly, so that applications retain full control over backend selection.

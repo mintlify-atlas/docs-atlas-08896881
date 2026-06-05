@@ -1,0 +1,268 @@
+---
+title: "Generating Rust bindings for custom Wayland protocols"
+sidebarTitle: "Custom Protocols"
+description: "Use wayland-scanner proc-macros to generate type-safe Rust bindings from any Wayland XML protocol specification file."
+---
+
+Every Wayland protocol is defined in an XML file. The standard toolchain converts that XML into C glue code; wayland-rs replaces that step with a set of procedural macros in the `wayland-scanner` crate that generate idiomatic Rust code at compile time. If the protocol you need is not already covered by `wayland-protocols`, `wayland-protocols-wlr`, or `wayland-protocols-plasma`, you can point these macros at your own XML file and get the same type-safe bindings that the official crates provide.
+
+## When to use custom bindings
+
+Use `wayland-scanner` directly when:
+
+- You are implementing a private or proprietary compositor protocol not available in any published crate.
+- You need a protocol that exists upstream but has not yet been packaged (e.g. a very new or experimental spec).
+- You are embedding a third-party `.xml` specification that is not suitable for upstreaming.
+
+For protocols already available in `wayland-protocols`, `wayland-protocols-wlr`, or `wayland-protocols-plasma`, prefer those crates — they are kept in sync with upstream and require no build-time XML parsing in your crate.
+
+## Adding the dependency
+
+`wayland-scanner` is a proc-macro crate. Add it alongside `wayland-client` or `wayland-server`:
+
+<CodeGroup>
+```toml Client-side custom protocol
+[dependencies]
+wayland-client = "0.31"
+wayland-scanner = "0.31"
+```
+
+```toml Server-side custom protocol
+[dependencies]
+wayland-server = "0.31"
+wayland-scanner = "0.31"
+```
+
+```toml Both sides
+[dependencies]
+wayland-client = "0.31"
+wayland-server = "0.31"
+wayland-scanner = "0.31"
+```
+</CodeGroup>
+
+## The three proc-macros
+
+`wayland-scanner` exposes three proc-macros. All three accept a single string literal — the path to the XML file **relative to `CARGO_MANIFEST_DIR`** (the directory containing your `Cargo.toml`).
+
+| Macro | Purpose |
+|-------|---------|
+| `generate_interfaces!` | Generates the low-level `wl_interface` C-compatible structures used internally by the wayland-backend dispatch machinery |
+| `generate_client_code!` | Generates client-side Rust types — proxy structs, request methods, event enums, and `Dispatch` plumbing |
+| `generate_server_code!` | Generates server-side Rust types — resource structs, event methods, request enums, and handler traits |
+
+You never call `generate_interfaces!` directly in user code — it populates the `__interfaces` inner module that the client and server code macros reference.
+
+## Module template
+
+The canonical module layout comes directly from the `wayland-scanner` documentation. Wrap everything in a module so the generated names do not pollute your crate's root namespace. The path is resolved at compile time relative to `CARGO_MANIFEST_DIR`.
+
+### Client-side
+
+```rust
+// Generate the bindings in their own module
+pub mod my_protocol {
+    use wayland_client;
+    // Import objects from the core protocol if needed
+    use wayland_client::protocol::*;
+
+    // This module hosts a low-level representation of the protocol objects.
+    // You will not need to interact with it yourself, but the code generated
+    // by the generate_client_code! macro will use it.
+    pub mod __interfaces {
+        // Import the interfaces from the core protocol if needed
+        use wayland_client::protocol::__interfaces::*;
+        wayland_scanner::generate_interfaces!("./protocols/my-protocol.xml");
+    }
+    use self::__interfaces::*;
+
+    // This macro generates the actual types that represent the Wayland objects
+    // of your custom protocol
+    wayland_scanner::generate_client_code!("./protocols/my-protocol.xml");
+}
+```
+
+### Server-side
+
+The server-side template is identical except `client` is replaced with `server` throughout:
+
+```rust
+pub mod my_protocol {
+    use wayland_server;
+    use wayland_server::protocol::*;
+
+    pub mod __interfaces {
+        use wayland_server::protocol::__interfaces::*;
+        wayland_scanner::generate_interfaces!("./protocols/my-protocol.xml");
+    }
+    use self::__interfaces::*;
+
+    wayland_scanner::generate_server_code!("./protocols/my-protocol.xml");
+}
+```
+
+## Protocols that depend on other protocols
+
+If your XML file references interfaces from another protocol (e.g. `xdg_surface` from XDG Shell, or `wl_surface` from the core protocol), you must import those interfaces into the `__interfaces` submodule so the generated code can reference them. For core Wayland objects, the `use wayland_client::protocol::__interfaces::*` line already covers this. For extension protocols from `wayland-protocols`, import the relevant `__interfaces` module:
+
+```rust
+pub mod my_toplevel_extension {
+    use wayland_client;
+    use wayland_client::protocol::*;
+    use wayland_protocols::xdg::shell::client::*; // re-exported proxy types
+
+    pub mod __interfaces {
+        use wayland_client::protocol::__interfaces::*;
+        // Make xdg_surface's interface descriptor visible to the generated code
+        use wayland_protocols::xdg::shell::client::__interfaces::*;
+        wayland_scanner::generate_interfaces!("./protocols/my-toplevel-extension.xml");
+    }
+    use self::__interfaces::*;
+
+    wayland_scanner::generate_client_code!("./protocols/my-toplevel-extension.xml");
+}
+```
+
+<Note>
+Each XML file must be parsed twice — once by `generate_interfaces!` and once by `generate_client_code!` or `generate_server_code!`. Both macros resolve the path relative to `CARGO_MANIFEST_DIR` at compile time. Rustc caches the result, so there is no runtime overhead.
+</Note>
+
+## Understanding the `__interfaces` module
+
+The `__interfaces` submodule is an implementation detail of the wayland-backend wire protocol layer. It contains `wl_interface` descriptors — C-compatible static structures that encode each interface's name, version, and the argument types of all its requests and events. These descriptors are used by `wayland-backend` to validate messages at the wire level.
+
+You interact with these descriptors only indirectly:
+
+- `generate_interfaces!` populates `__interfaces` with descriptors for the interfaces in your XML file.
+- `generate_client_code!` / `generate_server_code!` reference those descriptors when constructing proxy or resource objects.
+- The `use self::__interfaces::*` glob import makes the descriptors visible to the generated code within the same module.
+
+When your protocol references an external interface (e.g. `xdg_surface`), you import that interface's descriptor from the corresponding external `__interfaces` module so the generated code can resolve cross-protocol argument types.
+
+## Complete worked example
+
+Suppose you have a custom compositor protocol in `protocols/my-bar-protocol.xml` that defines a `my_bar_manager_v1` global. Here is the full setup:
+
+<Steps>
+  <Step title="Place the XML file">
+    Put the protocol XML at a path relative to your `Cargo.toml`:
+
+    ```
+    my-crate/
+    ├── Cargo.toml
+    ├── protocols/
+    │   └── my-bar-protocol.xml
+    └── src/
+        └── main.rs
+    ```
+  </Step>
+
+  <Step title="Add dependencies">
+    ```toml
+    # Cargo.toml
+    [dependencies]
+    wayland-client = "0.31"
+    wayland-scanner = "0.31"
+    ```
+  </Step>
+
+  <Step title="Generate the bindings">
+    In `src/main.rs` (or a dedicated module file):
+
+    ```rust
+    pub mod my_bar_protocol {
+        use wayland_client;
+        use wayland_client::protocol::*;
+
+        pub mod __interfaces {
+            use wayland_client::protocol::__interfaces::*;
+            wayland_scanner::generate_interfaces!("./protocols/my-bar-protocol.xml");
+        }
+        use self::__interfaces::*;
+
+        wayland_scanner::generate_client_code!("./protocols/my-bar-protocol.xml");
+    }
+    ```
+  </Step>
+
+  <Step title="Use the generated types">
+    The macro generates one proxy struct per `<interface>` element in the XML. Assuming the XML declares `my_bar_manager_v1`, the type `my_bar_protocol::client::my_bar_manager_v1::MyBarManagerV1` is now available.
+
+    ```rust
+    use my_bar_protocol::client::my_bar_manager_v1;
+
+    impl Dispatch<wl_registry::WlRegistry, ()> for State {
+        fn event(
+            &self,
+            state: &mut State,
+            registry: &wl_registry::WlRegistry,
+            event: wl_registry::Event,
+            _: &(),
+            qh: &QueueHandle<State>,
+        ) {
+            if let wl_registry::Event::Global { name, interface, version } = event {
+                if interface == "my_bar_manager_v1" {
+                    state.bar_manager = Some(
+                        registry.bind::<my_bar_manager_v1::MyBarManagerV1, _, _>(
+                            name, version, qh, ()
+                        )
+                    );
+                }
+            }
+        }
+    }
+    ```
+  </Step>
+</Steps>
+
+## Mirroring the wayland-protocols crate pattern
+
+The `wayland-protocols` crate internally uses a `wayland_protocol!` macro that wraps both client and server generation behind `#[cfg(feature = "client")]` and `#[cfg(feature = "server")]` gates. You can replicate this pattern in your own crate to ship a clean protocol library:
+
+```rust
+macro_rules! my_protocol {
+    ($path:expr, [$($imports:path),*]) => {
+        #[cfg(feature = "client")]
+        pub mod client {
+            use wayland_client;
+            use wayland_client::protocol::*;
+            $(use $imports::{client::*};)*
+
+            pub mod __interfaces {
+                use wayland_client::protocol::__interfaces::*;
+                $(use $imports::{client::__interfaces::*};)*
+                wayland_scanner::generate_interfaces!($path);
+            }
+            use self::__interfaces::*;
+            wayland_scanner::generate_client_code!($path);
+        }
+
+        #[cfg(feature = "server")]
+        pub mod server {
+            use wayland_server;
+            use wayland_server::protocol::*;
+            $(use $imports::{server::*};)*
+
+            pub mod __interfaces {
+                use wayland_server::protocol::__interfaces::*;
+                $(use $imports::{server::__interfaces::*};)*
+                wayland_scanner::generate_interfaces!($path);
+            }
+            use self::__interfaces::*;
+            wayland_scanner::generate_server_code!($path);
+        }
+    }
+}
+
+pub mod my_bar {
+    my_protocol!("./protocols/my-bar-protocol.xml", []);
+}
+```
+
+<Warning>
+The path string passed to all three macros must be a string literal — it cannot be a `const` or a macro-expanded value. It is resolved at compile time by the proc-macro relative to the `CARGO_MANIFEST_DIR` environment variable, which Cargo sets automatically during builds.
+</Warning>
+
+<Tip>
+If you maintain a private protocol library used across multiple crates, consider publishing it as a dedicated crate with `client` and `server` features, following the same structure as `wayland-protocols-wlr`. Downstream consumers then add a simple dependency line and select the features they need, with no knowledge of the underlying XML required.
+</Tip>

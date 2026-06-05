@@ -1,0 +1,244 @@
+---
+title: "wlroots protocol extensions with wayland-protocols-wlr"
+sidebarTitle: "WLR Protocols"
+description: "wayland-protocols-wlr provides Rust bindings for the wlroots compositor protocol extensions, including layer-shell, screencopy, and output power management."
+---
+
+The `wayland-protocols-wlr` crate provides pre-generated Rust bindings for the [wlr-protocols](https://gitlab.freedesktop.org/wlroots/wlr-protocols) repository — a collection of Wayland protocol extensions created by and for the [wlroots](https://gitlab.freedesktop.org/wlroots/wlroots) compositor library. These protocols are widely implemented beyond wlroots itself; compositors such as Sway, Hyprland, and River support them, making them the practical standard for many advanced desktop shell features.
+
+Unlike the official `wayland-protocols` repository, wlr-protocols does not use a formal stability tier system. All interfaces carry the `zwlr_` prefix (the `z` indicating they originated as "unstable" in the broader ecosystem). In practice, many of these protocols are extremely stable and used in production by a large number of projects.
+
+## Cargo setup
+
+Add `wayland-protocols-wlr` to your `Cargo.toml` and select the `client` feature, the `server` feature, or both. The crate automatically enables the corresponding `wayland-protocols` feature for any protocols that depend on XDG Shell.
+
+<CodeGroup>
+```toml Client-side
+[dependencies]
+wayland-client = "0.31"
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+```
+
+```toml Server-side (compositor)
+[dependencies]
+wayland-server = "0.31"
+wayland-protocols-wlr = { version = "0.3", features = ["server"] }
+```
+
+```toml Both sides
+[dependencies]
+wayland-client = "0.31"
+wayland-server = "0.31"
+wayland-protocols-wlr = { version = "0.3", features = ["client", "server"] }
+```
+</CodeGroup>
+
+## Available protocols
+
+Each protocol is a top-level module in the crate. The `client` and `server` sub-modules within each are gated behind the respective Cargo features, exactly as in `wayland-client` and `wayland-server`.
+
+### Layer Shell — `layer_shell::v1`
+
+`zwlr_layer_shell_v1` is arguably the most widely used wlr protocol. It allows a privileged client to place surfaces in one of four ordered layers (`background`, `bottom`, `top`, `overlay`) that sit above or below normal application windows. This is the standard mechanism for desktop shells, wallpaper renderers, notification daemons, and on-screen keyboards to position their surfaces.
+
+```rust
+use wayland_protocols_wlr::layer_shell::v1::client::{
+    zwlr_layer_shell_v1,
+    zwlr_layer_surface_v1,
+};
+```
+
+The layer-shell protocol depends on `xdg-shell` for popup support; `wayland-protocols-wlr` handles this transitive dependency automatically.
+
+### Screencopy — `screencopy::v1`
+
+`zwlr_screencopy_manager_v1` allows clients to request that the compositor copy a region of screen content into a client-provided `wl_buffer`. This is the standard mechanism for screenshot tools, screen recorders, and remote desktop applications on wlroots-based compositors.
+
+```rust
+use wayland_protocols_wlr::screencopy::v1::client::{
+    zwlr_screencopy_frame_v1,
+    zwlr_screencopy_manager_v1,
+};
+```
+
+### Data Control — `data_control::v1`
+
+`zwlr_data_control_manager_v1` gives privileged clients the ability to read and set the clipboard selection and primary selection, independently of keyboard focus. Clipboard managers are the primary consumer of this protocol.
+
+```rust
+use wayland_protocols_wlr::data_control::v1::client::{
+    zwlr_data_control_manager_v1,
+    zwlr_data_control_device_v1,
+    zwlr_data_control_source_v1,
+    zwlr_data_control_offer_v1,
+};
+```
+
+### Output Power Management — `output_power_management::v1`
+
+`zwlr_output_power_manager_v1` allows clients to control DPMS-like power states for individual outputs — turning them on, off, or into a standby mode. Desktop shells use this to implement idle-triggered screen blanking.
+
+```rust
+use wayland_protocols_wlr::output_power_management::v1::client::{
+    zwlr_output_power_manager_v1,
+    zwlr_output_power_v1,
+};
+```
+
+### Output Management — `output_management::v1`
+
+`zwlr_output_manager_v1` exposes the full set of compositor output configuration properties — mode, position, transform, scale — and allows clients to atomically apply a new configuration. Display configuration tools use this protocol.
+
+```rust
+use wayland_protocols_wlr::output_management::v1::client::{
+    zwlr_output_manager_v1,
+    zwlr_output_configuration_v1,
+};
+```
+
+### Foreign Toplevel Management — `foreign_toplevel::v1`
+
+`zwlr_foreign_toplevel_manager_v1` enumerates all open application windows (toplevels) across all clients, and provides requests to activate, minimize, maximize, or close them. Taskbars and window switchers are the primary consumers.
+
+```rust
+use wayland_protocols_wlr::foreign_toplevel::v1::client::{
+    zwlr_foreign_toplevel_manager_v1,
+    zwlr_foreign_toplevel_handle_v1,
+};
+```
+
+### Gamma Control — `gamma_control::v1`
+
+`zwlr_gamma_control_manager_v1` allows a privileged client to set the gamma lookup table for an output. Color temperature adjustment tools (e.g. blue-light filters) use this.
+
+```rust
+use wayland_protocols_wlr::gamma_control::v1::client::zwlr_gamma_control_manager_v1;
+```
+
+### Export DMA-BUF — `export_dmabuf::v1`
+
+`zwlr_export_dmabuf_manager_v1` provides low-overhead screen capture by exporting output or surface content as DMA-BUF file descriptors, avoiding a CPU copy.
+
+```rust
+use wayland_protocols_wlr::export_dmabuf::v1::client::zwlr_export_dmabuf_manager_v1;
+```
+
+### Input Inhibitor — `input_inhibitor::v1`
+
+`zwlr_input_inhibit_manager_v1` prevents any other client from receiving input events for the duration the inhibitor is held. Used by lock-screen implementations.
+
+```rust
+use wayland_protocols_wlr::input_inhibitor::v1::client::zwlr_input_inhibit_manager_v1;
+```
+
+### Virtual Pointer — `virtual_pointer::v1`
+
+`zwlr_virtual_pointer_manager_v1` lets clients synthesise pointer events, enabling remote desktop servers and accessibility tools to inject mouse input.
+
+```rust
+use wayland_protocols_wlr::virtual_pointer::v1::client::zwlr_virtual_pointer_manager_v1;
+```
+
+---
+
+## Usage example: layer-shell client
+
+The following example shows the minimal wiring needed to bind `zwlr_layer_shell_v1` from the registry and create a surface anchored to the top of the screen — the basis for a status bar or notification area.
+
+```rust
+use wayland_client::{
+    Connection, Dispatch, QueueHandle, NoopIgnore,
+    protocol::{wl_compositor, wl_registry, wl_surface},
+};
+use wayland_protocols_wlr::layer_shell::v1::client::{
+    zwlr_layer_shell_v1, zwlr_layer_surface_v1,
+};
+
+struct State {
+    compositor: Option<wl_compositor::WlCompositor>,
+    layer_shell: Option<zwlr_layer_shell_v1::ZwlrLayerShellV1>,
+    surface: Option<wl_surface::WlSurface>,
+}
+
+impl Dispatch<wl_registry::WlRegistry, ()> for State {
+    fn event(
+        &self,
+        state: &mut State,
+        registry: &wl_registry::WlRegistry,
+        event: wl_registry::Event,
+        _: &(),
+        qh: &QueueHandle<State>,
+    ) {
+        if let wl_registry::Event::Global { name, interface, version } = event {
+            match interface.as_str() {
+                "wl_compositor" => {
+                    state.compositor = Some(
+                        registry.bind::<wl_compositor::WlCompositor, _, _>(name, version, qh, ())
+                    );
+                }
+                "zwlr_layer_shell_v1" => {
+                    state.layer_shell = Some(
+                        registry.bind::<zwlr_layer_shell_v1::ZwlrLayerShellV1, _, _>(
+                            name, version, qh, ()
+                        )
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+fn create_bar(state: &State, qh: &QueueHandle<State>) -> zwlr_layer_surface_v1::ZwlrLayerSurfaceV1 {
+    let compositor = state.compositor.as_ref().unwrap();
+    let layer_shell = state.layer_shell.as_ref().unwrap();
+
+    let surface = compositor.create_surface(qh, NoopIgnore);
+
+    // Place the surface in the "top" layer on the default output (None = current output)
+    let layer_surface = layer_shell.get_layer_surface(
+        &surface,
+        None,                                      // output (None = compositor picks)
+        zwlr_layer_shell_v1::Layer::Top,
+        "my-bar".to_string(),
+        qh,
+        (),
+    );
+
+    // Anchor to the top edge, stretch full width, set a fixed height
+    layer_surface.set_anchor(
+        zwlr_layer_surface_v1::Anchor::Top
+            | zwlr_layer_surface_v1::Anchor::Left
+            | zwlr_layer_surface_v1::Anchor::Right,
+    );
+    layer_surface.set_size(0, 30); // 0 width = stretch to anchored edges
+    layer_surface.set_exclusive_zone(30); // reserve 30px so windows don't overlap
+
+    surface.commit();
+    layer_surface
+}
+
+impl Dispatch<zwlr_layer_surface_v1::ZwlrLayerSurfaceV1, ()> for State {
+    fn event(
+        &self,
+        _state: &mut State,
+        layer_surface: &zwlr_layer_surface_v1::ZwlrLayerSurfaceV1,
+        event: zwlr_layer_surface_v1::Event,
+        _: &(),
+        _qh: &QueueHandle<State>,
+    ) {
+        // Always acknowledge configure events
+        if let zwlr_layer_surface_v1::Event::Configure { serial, .. } = event {
+            layer_surface.ack_configure(serial);
+        }
+    }
+}
+```
+
+<Note>
+`zwlr_layer_surface_v1` follows the same configure/ack_configure handshake as `xdg_surface`. The compositor sends a `configure` event with the allocated width and height; the client must call `ack_configure(serial)` and then commit a buffer of the negotiated size before any content is shown.
+</Note>
+
+<Warning>
+wlr-protocols are implemented on a best-effort basis. Not every Wayland compositor supports them — they are most reliably available on compositors built with wlroots (Sway, Hyprland, River, Cage) and on some others that have independently implemented them. Always check for the global's presence in the registry before assuming availability.
+</Warning>

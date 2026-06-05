@@ -1,0 +1,442 @@
+---
+title: "Implementing Dispatch for Wayland object events"
+sidebarTitle: "Dispatch"
+description: "The Dispatch trait routes Wayland events to your application state. Learn how to implement it for every Wayland object your client uses."
+---
+
+The `Dispatch` trait is the backbone of event processing in `wayland-client`. Every Wayland object your client manages—registry, compositor, surface, keyboard, shell—sends events back from the compositor. `Dispatch` is how you tell the library what to do when each of those events arrives. This page explains the trait's full signature, the role of user data, the helper types for ignoring events, and patterns for structuring `Dispatch` across a real application.
+
+## Trait signature
+
+```rust
+pub trait Dispatch<I, State>
+where
+    I: Proxy,
+{
+    fn event(
+        &self,
+        state: &mut State,
+        proxy: &I,
+        event: I::Event,
+        conn: &Connection,
+        qhandle: &QueueHandle<State>,
+    );
+
+    // Optional: only needed when an event creates a new child object.
+    fn event_created_child(opcode: u16, qhandle: &QueueHandle<State>) -> Arc<dyn ObjectData> {
+        // default implementation panics
+    }
+}
+```
+
+The two type parameters are:
+
+| Parameter | Role |
+|-----------|------|
+| `I: Proxy` | The Wayland interface whose events this implementation handles. |
+| `State` | Your top-level application state struct. |
+
+Notice that `Dispatch` is implemented *on the user-data type*, not directly on `State`. The `event()` method receives `&self` (the user data) and `&mut State` (the shared application state). This is the mechanism that lets different instances of the same interface be dispatched differently based on the user data attached to each object.
+
+## The `event()` method parameters
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `state` | `&mut State` | Mutable reference to your app state—safe to modify freely. |
+| `proxy` | `&I` | The proxy that received this event. Useful for calling methods on the object in response. |
+| `event` | `I::Event` | The strongly-typed event enum. Match on it to handle specific events. |
+| `conn` | `&Connection` | The connection, in case you need to create objects outside an event queue. |
+| `qhandle` | `&QueueHandle<State>` | The queue handle for this dispatch invocation. Use it to create child objects assigned to the same queue. |
+
+## User data: differentiating object instances
+
+Every Wayland object carries a user-data value whose type is the second type parameter of its `Dispatch` implementation. You supply this value when you create the object:
+
+```rust
+// Creates a WlSurface with user data type `SurfaceRole`
+let surface = compositor.create_surface(&qh, SurfaceRole::Toplevel);
+```
+
+When an event arrives for that surface, `wayland-client` looks up the user data, downcasts it to the expected type, and calls `Dispatch::event()` on it. Two surfaces with different user-data types will call different `Dispatch` implementations even though they are the same interface.
+
+### Simple case: `()` as user data
+
+When you have only one kind of object and no per-object state is needed:
+
+```rust
+use wayland_client::{
+    protocol::wl_registry, Connection, Dispatch, QueueHandle,
+};
+
+struct AppState {
+    compositor: Option<wayland_client::protocol::wl_compositor::WlCompositor>,
+}
+
+impl Dispatch<wl_registry::WlRegistry, ()> for AppState {
+    fn event(
+        &mut self,
+        registry: &wl_registry::WlRegistry,
+        event: wl_registry::Event,
+        _data: &(),
+        _conn: &Connection,
+        qh: &QueueHandle<Self>,
+    ) {
+        if let wl_registry::Event::Global { name, interface, version } = event {
+            if interface == "wl_compositor" {
+                let comp = registry.bind(name, version.min(5), qh, ());
+                self.compositor = Some(comp);
+            }
+        }
+    }
+}
+```
+
+### Storing per-object state in user data
+
+For objects where each instance needs its own data—for example tracking whether a surface has been configured:
+
+```rust
+use wayland_client::{Dispatch, QueueHandle, Connection};
+use wayland_client::protocol::wl_surface;
+
+struct SurfaceData {
+    configured: bool,
+    width: i32,
+    height: i32,
+}
+
+struct AppState;
+
+impl Dispatch<wl_surface::WlSurface, SurfaceData> for AppState {
+    fn event(
+        &mut self,
+        _proxy: &wl_surface::WlSurface,
+        event: wl_surface::Event,
+        data: &SurfaceData,   // immutable borrow of per-object state
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        // wl_surface events rarely carry config info; the XDG layer does.
+        // But you can read `data` for per-object metadata.
+        let _ = data.width;
+    }
+}
+```
+
+<Note>
+User data is stored behind an `Arc<dyn Any + Send + Sync>` inside `QueueProxyData`, so it must be `Send + Sync + 'static`. If you need to mutate per-object state in response to events, wrap it in a `Mutex` or `Cell`, or store it in the main `State` struct indexed by object ID.
+</Note>
+
+### Storing per-object state in the main state struct
+
+An alternative to user data is to store a simple identifier in the user data and look up the real state in `State`:
+
+```rust
+use std::collections::HashMap;
+use wayland_client::{protocol::wl_surface, Connection, Dispatch, QueueHandle, Proxy};
+
+struct SurfaceState {
+    width: u32,
+    height: u32,
+}
+
+struct AppState {
+    surfaces: HashMap<u32, SurfaceState>,
+}
+
+// Use u32 (the object's numeric ID) as user data
+impl Dispatch<wl_surface::WlSurface, ()> for AppState {
+    fn event(
+        &mut self,
+        proxy: &wl_surface::WlSurface,
+        _event: wl_surface::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        // Look up per-object state by the object's ID
+        if let Some(s) = self.surfaces.get_mut(&proxy.id().protocol_id()) {
+            s.width = 800; // example
+        }
+    }
+}
+```
+
+## `Noop` and `NoopIgnore`
+
+Two built-in implementations save you from writing boilerplate for objects whose events you don't care about.
+
+### `Noop` — asserts events never arrive
+
+`Noop` implements `Dispatch` for every interface and *panics* if any event is ever delivered. Use it for objects that should not produce events in your use-case, to catch unexpected compositor behaviour during development:
+
+```rust
+use wayland_client::{Noop, protocol::wl_compositor};
+
+// WlCompositor sends no events; Noop makes that assumption explicit.
+let compositor = registry.bind::<wl_compositor::WlCompositor, _, _>(name, 5, &qh, Noop);
+```
+
+### `NoopIgnore` — silently discards all events
+
+`NoopIgnore` also implements `Dispatch` for every interface but does nothing when events arrive. Use it for objects whose events you genuinely want to discard:
+
+```rust
+use wayland_client::{NoopIgnore, protocol::wl_shm_pool};
+
+let pool = shm.create_pool(fd, size, &qh, NoopIgnore);
+// wl_shm_pool has no meaningful events for most clients
+```
+
+## `QueueProxyData` — how object data is stored
+
+Under the hood, `QueueHandle::make_data()` creates a `QueueProxyData<I, U, State>` which implements `wayland-backend`'s `ObjectData` trait:
+
+```rust
+pub struct QueueProxyData<I: Proxy, U, State> {
+    handle: QueueHandle<State>,
+    pub udata: U,
+    // ...
+}
+```
+
+When the backend delivers a message for an object:
+1. `QueueProxyData::event()` checks if the message contains a `NewId` argument (meaning the event creates a child object). If so, it calls `U::event_created_child()` to allocate `ObjectData` for the new object.
+2. It pushes the raw message into the `EventQueue`'s internal `VecDeque`.
+3. When `dispatch_pending()` or `blocking_dispatch()` drains the queue, `queue_callback` parses the message and calls `U::event()` (your `Dispatch` implementation).
+
+You can access the user data directly from any proxy via `Proxy::data::<U>()`:
+
+```rust
+let udata: Option<&SurfaceData> = surface.data::<SurfaceData>();
+```
+
+## Implementing `Dispatch` for multiple objects
+
+Real applications implement `Dispatch` for many interface types. The `simple_window` example from the repository demonstrates this pattern clearly—a single `GlobalData` user-data type dispatches for the registry, the XDG shell, surfaces, and keyboard:
+
+```rust
+use wayland_client::{
+    Connection, Dispatch, NoopIgnore, QueueHandle,
+    protocol::{wl_buffer, wl_compositor, wl_keyboard, wl_registry, wl_seat, wl_shm, wl_surface},
+};
+use wayland_protocols::xdg::shell::client::{xdg_surface, xdg_toplevel, xdg_wm_base};
+
+struct GlobalData;
+
+struct State {
+    running: bool,
+    base_surface: Option<wl_surface::WlSurface>,
+    buffer: Option<wl_buffer::WlBuffer>,
+    wm_base: Option<xdg_wm_base::XdgWmBase>,
+    xdg_surface: Option<(xdg_surface::XdgSurface, xdg_toplevel::XdgToplevel)>,
+    configured: bool,
+}
+
+// Registry: bind the globals we need
+impl Dispatch<wl_registry::WlRegistry, State> for GlobalData {
+    fn event(
+        &self,
+        state: &mut State,
+        registry: &wl_registry::WlRegistry,
+        event: wl_registry::Event,
+        _: &Connection,
+        qh: &QueueHandle<State>,
+    ) {
+        if let wl_registry::Event::Global { name, interface, .. } = event {
+            match &interface[..] {
+                "wl_compositor" => {
+                    let compositor =
+                        registry.bind::<wl_compositor::WlCompositor, _, _>(name, 1, qh, NoopIgnore);
+                    let surface = compositor.create_surface(qh, NoopIgnore);
+                    state.base_surface = Some(surface);
+                }
+                "wl_seat" => {
+                    registry.bind::<wl_seat::WlSeat, _, _>(name, 1, qh, GlobalData);
+                }
+                "xdg_wm_base" => {
+                    let wm_base =
+                        registry.bind::<xdg_wm_base::XdgWmBase, _, _>(name, 1, qh, GlobalData);
+                    state.wm_base = Some(wm_base);
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+// XDG WM Base: respond to ping to keep the connection alive
+impl Dispatch<xdg_wm_base::XdgWmBase, State> for GlobalData {
+    fn event(
+        &self,
+        _: &mut State,
+        wm_base: &xdg_wm_base::XdgWmBase,
+        event: xdg_wm_base::Event,
+        _: &Connection,
+        _: &QueueHandle<State>,
+    ) {
+        if let xdg_wm_base::Event::Ping { serial } = event {
+            wm_base.pong(serial);
+        }
+    }
+}
+
+// XDG Surface: acknowledge configure events before committing
+impl Dispatch<xdg_surface::XdgSurface, State> for GlobalData {
+    fn event(
+        &self,
+        state: &mut State,
+        xdg_surface: &xdg_surface::XdgSurface,
+        event: xdg_surface::Event,
+        _: &Connection,
+        _: &QueueHandle<State>,
+    ) {
+        if let xdg_surface::Event::Configure { serial, .. } = event {
+            xdg_surface.ack_configure(serial);
+            state.configured = true;
+            if let (Some(surface), Some(buffer)) =
+                (state.base_surface.as_ref(), state.buffer.as_ref())
+            {
+                surface.attach(Some(buffer), 0, 0);
+                surface.commit();
+            }
+        }
+    }
+}
+
+// XDG Toplevel: handle window close
+impl Dispatch<xdg_toplevel::XdgToplevel, State> for GlobalData {
+    fn event(
+        &self,
+        state: &mut State,
+        _: &xdg_toplevel::XdgToplevel,
+        event: xdg_toplevel::Event,
+        _: &Connection,
+        _: &QueueHandle<State>,
+    ) {
+        if let xdg_toplevel::Event::Close = event {
+            state.running = false;
+        }
+    }
+}
+
+// Seat: detect keyboard capability and get keyboard
+impl Dispatch<wl_seat::WlSeat, State> for GlobalData {
+    fn event(
+        &self,
+        _: &mut State,
+        seat: &wl_seat::WlSeat,
+        event: wl_seat::Event,
+        _: &Connection,
+        qh: &QueueHandle<State>,
+    ) {
+        if let wl_seat::Event::Capabilities { capabilities } = event {
+            if capabilities.contains(wl_seat::Capability::Keyboard) {
+                seat.get_keyboard(qh, GlobalData);
+            }
+        }
+    }
+}
+
+// Keyboard: exit on ESC
+impl Dispatch<wl_keyboard::WlKeyboard, State> for GlobalData {
+    fn event(
+        &self,
+        state: &mut State,
+        _: &wl_keyboard::WlKeyboard,
+        event: wl_keyboard::Event,
+        _: &Connection,
+        _: &QueueHandle<State>,
+    ) {
+        if let wl_keyboard::Event::Key { key, .. } = event {
+            if key == 1 {
+                // ESC key
+                state.running = false;
+            }
+        }
+    }
+}
+```
+
+## Generic `Dispatch` implementations for libraries
+
+If you are writing a library or toolkit (like Smithay's Client Toolkit) that provides reusable Wayland handling, make your `Dispatch` implementation generic over the downstream `State`:
+
+```rust
+use wayland_client::{protocol::wl_registry, Dispatch, QueueHandle};
+
+struct MyUserData;
+
+// Generic over the downstream state type
+impl<State> Dispatch<wl_registry::WlRegistry, State> for MyUserData
+where
+    State: Dispatch<wl_registry::WlRegistry, MyUserData>,
+    State: AsMut<MyLibraryState>,
+{
+    fn event(
+        &self,
+        state: &mut State,
+        proxy: &wl_registry::WlRegistry,
+        event: wl_registry::Event,
+        conn: &wayland_client::Connection,
+        qhandle: &QueueHandle<State>,
+    ) {
+        let lib_state: &mut MyLibraryState = state.as_mut();
+        // process event using lib_state
+    }
+}
+```
+
+The key constraint is that `State` must itself implement `Dispatch<WlRegistry, MyUserData>`. This creates a delegation chain: the app state delegates handling of this particular `(interface, user-data)` combination to your library's implementation.
+
+<Warning>
+Due to limitations in Rust's trait resolution, the type providing a generic `Dispatch` implementation cannot itself be the top-level dispatch state. The generic user-data type and the application `State` must be distinct types.
+</Warning>
+
+## `event_created_child` for events that produce objects
+
+A handful of Wayland events create new child objects as part of the event itself (in the core protocol, `wl_data_device.data_offer` is the canonical example). In these cases you must override `event_created_child` to provide the `ObjectData` for the newly created object. The `event_created_child!` macro makes this straightforward:
+
+```rust
+use wayland_client::event_created_child;
+use wayland_client::protocol::wl_data_device;
+
+impl Dispatch<wl_data_device::WlDataDevice, ()> for AppState {
+    fn event(
+        &mut self,
+        _proxy: &wl_data_device::WlDataDevice,
+        event: wl_data_device::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        // handle events
+    }
+
+    event_created_child!(AppState, wl_data_device::WlDataDevice, [
+        wl_data_device::EVT_DATA_OFFER_OPCODE => (
+            wayland_client::protocol::wl_data_offer::WlDataOffer,
+            ()  // user data for the new offer object
+        ),
+    ]);
+}
+```
+
+The macro generates the `event_created_child` method that matches on the event opcode and returns the correct `QueueProxyData` for the child interface.
+
+## Common patterns summary
+
+<CardGroup cols={2}>
+  <Card title="Unit user data `()`">
+    Use when you have one instance of an interface and no per-object metadata. Minimal boilerplate.
+  </Card>
+  <Card title="Custom struct user data">
+    Use when each object instance carries its own configuration or state that does not change after creation.
+  </Card>
+  <Card title="State-indexed by object ID">
+    Use when per-object state must be mutable. Store a `HashMap<ObjectId, Data>` in your `State` and look up by `proxy.id()`.
+  </Card>
+  <Card title="Generic delegation">
+    Use when writing reusable library code. Make `Dispatch` generic over `State` and add trait bounds for the parts of `State` your library needs.
+  </Card>
+</CardGroup>

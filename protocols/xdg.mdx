@@ -1,0 +1,430 @@
+---
+title: "XDG Shell and desktop protocols in wayland-protocols"
+sidebarTitle: "XDG Protocols"
+description: "The wayland-protocols crate includes XDG Shell, XDG Output, XDG Decoration, and other essential desktop extension protocols for client and server use."
+---
+
+The `wayland-protocols` crate bundles pre-generated Rust bindings for the official [wayland-protocols](https://gitlab.freedesktop.org/wayland/wayland-protocols) repository. It is divided into four top-level modules — `xdg`, `wp`, `ext`, and `xwayland` — each covering a distinct area of the Wayland extension ecosystem. This page walks through the most commonly used protocols, shows how to opt into staging and unstable tiers, and demonstrates real client-side usage with XDG Shell.
+
+## Cargo setup
+
+Add `wayland-protocols` to `Cargo.toml` alongside `wayland-client` or `wayland-server`. Stable protocols are available with only the `client`/`server` features; staging and unstable protocols require their respective feature flags.
+
+<CodeGroup>
+```toml Client-only (stable)
+[dependencies]
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client"] }
+```
+
+```toml Client + staging + unstable
+[dependencies]
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client", "staging", "unstable"] }
+```
+
+```toml Server-side compositor
+[dependencies]
+wayland-server = "0.31"
+wayland-protocols = { version = "0.32", features = ["server", "staging", "unstable"] }
+```
+</CodeGroup>
+
+## XDG protocols (`xdg` module)
+
+The `xdg` module contains protocols related to window management on desktop-oriented systems.
+
+### XDG Shell — `xdg::shell` (stable)
+
+XDG Shell is the replacement for the old `wl_shell` global and is the standard way for clients to create application windows. It exposes four key objects:
+
+| Object | Role |
+|--------|------|
+| `xdg_wm_base` | The compositor global; used to create `xdg_surface` objects and must respond to `ping` events |
+| `xdg_surface` | Wraps a `wl_surface` with XDG semantics; must be given a role (toplevel or popup) |
+| `xdg_toplevel` | Represents a normal application window with title, app-id, min/max size, and state |
+| `xdg_popup` | Represents a transient popup anchored to a parent surface |
+
+```rust
+use wayland_protocols::xdg::shell::client::{xdg_surface, xdg_toplevel, xdg_wm_base};
+```
+
+Because XDG Shell is a stable protocol, no additional feature flags are needed.
+
+#### Complete client example
+
+The following is the full `simple_window` example from the `wayland-client` crate. It binds `xdg_wm_base` from the registry, creates an `xdg_surface` over a `wl_surface`, promotes it to an `xdg_toplevel`, and handles the mandatory `configure`/`ack_configure` handshake before attaching a buffer.
+
+```rust
+use std::{fs::File, os::unix::io::AsFd};
+
+use wayland_client::{
+    Connection, Dispatch, NoopIgnore, QueueHandle,
+    protocol::{wl_buffer, wl_compositor, wl_keyboard, wl_registry, wl_seat, wl_shm, wl_surface},
+};
+
+use wayland_protocols::xdg::shell::client::{xdg_surface, xdg_toplevel, xdg_wm_base};
+
+struct GlobalData;
+
+fn main() {
+    let conn = Connection::connect_to_env().unwrap();
+
+    let mut event_queue = conn.new_event_queue();
+    let qhandle = event_queue.handle();
+
+    let display = conn.display();
+    display.get_registry(&qhandle, GlobalData);
+
+    let mut state = State {
+        running: true,
+        base_surface: None,
+        buffer: None,
+        wm_base: None,
+        xdg_surface: None,
+        configured: false,
+    };
+
+    while state.running {
+        event_queue.blocking_dispatch(&mut state).unwrap();
+    }
+}
+
+struct State {
+    running: bool,
+    base_surface: Option<wl_surface::WlSurface>,
+    buffer: Option<wl_buffer::WlBuffer>,
+    wm_base: Option<xdg_wm_base::XdgWmBase>,
+    xdg_surface: Option<(xdg_surface::XdgSurface, xdg_toplevel::XdgToplevel)>,
+    configured: bool,
+}
+
+impl Dispatch<wl_registry::WlRegistry, State> for GlobalData {
+    fn event(
+        &self,
+        state: &mut State,
+        registry: &wl_registry::WlRegistry,
+        event: wl_registry::Event,
+        _: &Connection,
+        qh: &QueueHandle<State>,
+    ) {
+        if let wl_registry::Event::Global { name, interface, .. } = event {
+            match &interface[..] {
+                "wl_compositor" => {
+                    let compositor =
+                        registry.bind::<wl_compositor::WlCompositor, _, _>(name, 1, qh, NoopIgnore);
+                    let surface = compositor.create_surface(qh, NoopIgnore);
+                    state.base_surface = Some(surface);
+
+                    if state.wm_base.is_some() && state.xdg_surface.is_none() {
+                        state.init_xdg_surface(qh);
+                    }
+                }
+                "wl_seat" => {
+                    registry.bind::<wl_seat::WlSeat, _, _>(name, 1, qh, GlobalData);
+                }
+                "xdg_wm_base" => {
+                    let wm_base =
+                        registry.bind::<xdg_wm_base::XdgWmBase, _, _>(name, 1, qh, GlobalData);
+                    state.wm_base = Some(wm_base);
+
+                    if state.base_surface.is_some() && state.xdg_surface.is_none() {
+                        state.init_xdg_surface(qh);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+impl State {
+    fn init_xdg_surface(&mut self, qh: &QueueHandle<State>) {
+        let wm_base = self.wm_base.as_ref().unwrap();
+        let base_surface = self.base_surface.as_ref().unwrap();
+
+        let xdg_surface = wm_base.get_xdg_surface(base_surface, qh, GlobalData);
+        let toplevel = xdg_surface.get_toplevel(qh, GlobalData);
+        toplevel.set_title("A fantastic window!".into());
+
+        base_surface.commit();
+
+        self.xdg_surface = Some((xdg_surface, toplevel));
+    }
+}
+
+// Respond to compositor pings to keep the connection alive
+impl Dispatch<xdg_wm_base::XdgWmBase, State> for GlobalData {
+    fn event(
+        &self,
+        _: &mut State,
+        wm_base: &xdg_wm_base::XdgWmBase,
+        event: xdg_wm_base::Event,
+        _: &Connection,
+        _: &QueueHandle<State>,
+    ) {
+        if let xdg_wm_base::Event::Ping { serial } = event {
+            wm_base.pong(serial);
+        }
+    }
+}
+
+// Acknowledge the configure event before attaching any buffer
+impl Dispatch<xdg_surface::XdgSurface, State> for GlobalData {
+    fn event(
+        &self,
+        state: &mut State,
+        xdg_surface: &xdg_surface::XdgSurface,
+        event: xdg_surface::Event,
+        _: &Connection,
+        _: &QueueHandle<State>,
+    ) {
+        if let xdg_surface::Event::Configure { serial, .. } = event {
+            xdg_surface.ack_configure(serial);
+            state.configured = true;
+            let surface = state.base_surface.as_ref().unwrap();
+            if let Some(ref buffer) = state.buffer {
+                surface.attach(Some(buffer), 0, 0);
+                surface.commit();
+            }
+        }
+    }
+}
+
+impl Dispatch<xdg_toplevel::XdgToplevel, State> for GlobalData {
+    fn event(
+        &self,
+        state: &mut State,
+        _: &xdg_toplevel::XdgToplevel,
+        event: xdg_toplevel::Event,
+        _: &Connection,
+        _: &QueueHandle<State>,
+    ) {
+        if let xdg_toplevel::Event::Close = event {
+            state.running = false;
+        }
+    }
+}
+```
+
+<Note>
+The `xdg_surface.ack_configure(serial)` call is mandatory. Compositors will not render a surface that has not acknowledged its configure event. Always respond to `xdg_surface::Event::Configure` before committing a buffer.
+</Note>
+
+### XDG Activation — `xdg::activation` (staging)
+
+`xdg_activation_v1` allows a client to request that the compositor raise another toplevel to the foreground. The requesting client obtains an activation token and passes it out-of-band (e.g. via D-Bus) to the target client, which then calls `xdg_activation_v1.activate`.
+
+```toml
+wayland-protocols = { version = "0.32", features = ["client", "staging"] }
+```
+
+```rust
+use wayland_protocols::xdg::activation::v1::client::xdg_activation_v1;
+```
+
+### XDG Toplevel Drag — `xdg::toplevel_drag` (staging)
+
+Enables detachable window panels: a client can attach an `xdg_toplevel` to an ongoing drag-and-drop operation so the compositor moves the window with the pointer.
+
+```rust
+use wayland_protocols::xdg::toplevel_drag::v1::client::xdg_toplevel_drag_v1;
+```
+
+### XDG Dialog — `xdg::dialog` (staging)
+
+Marks an `xdg_toplevel` as a dialog relative to another toplevel, giving the compositor a hint for placement and interaction policies.
+
+```rust
+use wayland_protocols::xdg::dialog::v1::client::xdg_dialog_v1;
+```
+
+### XDG Toplevel Icon — `xdg::toplevel_icon` (staging)
+
+Allows clients to set per-toplevel icons either by name (from the XDG icon stock) or by providing raw pixel data via `wl_buffer`.
+
+```rust
+use wayland_protocols::xdg::toplevel_icon::v1::client::xdg_toplevel_icon_manager_v1;
+```
+
+### XDG Toplevel Tag — `xdg::toplevel_tag` (staging)
+
+Provides a stable identifier tag for toplevels, enabling compositors to restore window properties (position, size, stacking order) across application restarts.
+
+```rust
+use wayland_protocols::xdg::toplevel_tag::v1::client::xdg_toplevel_tag_v1;
+```
+
+### XDG Decoration — `xdg::decoration` (unstable)
+
+`zxdg_decoration_manager_v1` lets a client and compositor negotiate whether window decorations (title bars, borders) should be drawn server-side or client-side.
+
+```toml
+wayland-protocols = { version = "0.32", features = ["client", "unstable"] }
+```
+
+```rust
+use wayland_protocols::xdg::decoration::zv1::client::zxdg_decoration_manager_v1;
+```
+
+### XDG Output — `xdg::xdg_output` (unstable)
+
+Extends `wl_output` with desktop-oriented information: the logical position of an output within the global compositor space, its logical size, and the connector name.
+
+```rust
+use wayland_protocols::xdg::xdg_output::zv1::client::zxdg_output_manager_v1;
+```
+
+### XDG Foreign — `xdg::foreign` (unstable)
+
+Provides a mechanism for one client to export a surface handle (a string) that another client can import to create a cross-client parent/child surface relationship. Useful for out-of-process dialogs.
+
+```rust
+// Exporting client
+use wayland_protocols::xdg::foreign::zv2::client::zxdg_exporter_v2;
+
+// Importing client
+use wayland_protocols::xdg::foreign::zv2::client::zxdg_importer_v2;
+```
+
+---
+
+## General-purpose protocols (`wp` module)
+
+The `wp` module groups protocols that are useful across many different application types and are not specific to window management.
+
+### Viewporter — `wp::viewporter` (stable)
+
+Decouples surface dimensions from buffer dimensions, enabling scaling and cropping without changing the underlying buffer.
+
+```rust
+use wayland_protocols::wp::viewporter::client::{wp_viewport, wp_viewporter};
+```
+
+### Presentation Time — `wp::presentation_time` (stable)
+
+Delivers precise feedback about when a frame was actually displayed, enabling smooth video playback and animation loops.
+
+```rust
+use wayland_protocols::wp::presentation_time::client::wp_presentation;
+```
+
+### Linux DMA-BUF — `wp::linux_dmabuf` (stable)
+
+The standard mechanism for zero-copy buffer sharing between GPU processes and the compositor. Used by multimedia and GPU-accelerated applications.
+
+```rust
+use wayland_protocols::wp::linux_dmabuf::zv1::client::zwp_linux_dmabuf_v1;
+```
+
+### Tablet — `wp::tablet` (stable v2 / unstable v1)
+
+Describes graphics tablet devices with support for pressure, tilt, rotation, and multiple tools.
+
+```rust
+// Stable version 2 (no extra feature needed)
+use wayland_protocols::wp::tablet::zv2::client::zwp_tablet_manager_v2;
+```
+
+### Fractional Scale — `wp::fractional_scale` (staging)
+
+Allows the compositor to advertise a non-integer scale factor (e.g. 1.5×) for a surface. The client should use `wp_viewport` to submit a buffer at the scaled resolution.
+
+```toml
+wayland-protocols = { version = "0.32", features = ["client", "staging"] }
+```
+
+```rust
+use wayland_protocols::wp::fractional_scale::v1::client::wp_fractional_scale_manager_v1;
+```
+
+### Color Management — `wp::color_management` (staging)
+
+Enables clients to describe the color properties of their surface content and to observe the color characteristics of outputs, supporting HDR and wide-gamut workflows.
+
+```rust
+use wayland_protocols::wp::color_management::v1::client::wp_color_manager_v1;
+```
+
+### Linux DRM Syncobj — `wp::linux_drm_syncobj` (staging)
+
+Provides explicit GPU synchronisation using Linux DRM timeline synchronisation objects, replacing implicit fence synchronisation.
+
+```rust
+use wayland_protocols::wp::linux_drm_syncobj::v1::client::wp_linux_drm_syncobj_manager_v1;
+```
+
+### Cursor Shape — `wp::cursor_shape` (staging, requires `unstable` for tablet)
+
+A simpler way for clients to request a named cursor shape from the compositor, eliminating the need to manage cursor surface buffers for common cursors.
+
+```toml
+# Requires both staging and unstable (cursor-shape depends on tablet zv2)
+wayland-protocols = { version = "0.32", features = ["client", "staging", "unstable"] }
+```
+
+```rust
+use wayland_protocols::wp::cursor_shape::v1::client::wp_cursor_shape_manager_v1;
+```
+
+### Tearing Control — `wp::tearing_control` (staging)
+
+Allows a client to opt into asynchronous page flips (tearing) in exchange for lower input latency — useful for games.
+
+```rust
+use wayland_protocols::wp::tearing_control::v1::client::wp_tearing_control_manager_v1;
+```
+
+### Single Pixel Buffer — `wp::single_pixel_buffer` (staging)
+
+Creates a 1×1 pixel `wl_buffer` that can be combined with `wp_viewport` to paint large solid-colour areas without allocating a full-size buffer.
+
+```rust
+use wayland_protocols::wp::single_pixel_buffer::v1::client::wp_single_pixel_buffer_manager_v1;
+```
+
+---
+
+## Miscellaneous protocols (`ext` module)
+
+The `ext` module covers protocols that do not fit neatly under `xdg` or `wp`. All of the following require the `staging` feature.
+
+```toml
+wayland-protocols = { version = "0.32", features = ["client", "staging"] }
+```
+
+| Module | Interface | Purpose |
+|--------|-----------|---------|
+| `ext::idle_notify` | `ext_idle_notifier_v1` | Notify clients when the user has been idle for a given duration |
+| `ext::session_lock` | `ext_session_lock_manager_v1` | Allow a privileged client to lock the session and display an arbitrary surface |
+| `ext::foreign_toplevel_list` | `ext_foreign_toplevel_list_v1` | Enumerate all open toplevels across clients (for taskbars, docks) |
+| `ext::image_capture_source` | `ext_image_capture_source_manager_v1` | Intermediate object for screen capture source negotiation |
+| `ext::image_copy_capture` | `ext_image_copy_capture_manager_v1` | Capture output or toplevel content into client-provided buffers |
+| `ext::data_control` | `ext_data_control_manager_v1` | Privileged clipboard management (read and set the selection) |
+| `ext::workspace` | `ext_workspace_manager_v1` | List and control virtual workspaces |
+
+```rust
+use wayland_protocols::ext::session_lock::v1::client::ext_session_lock_manager_v1;
+use wayland_protocols::ext::idle_notify::v1::client::ext_idle_notifier_v1;
+use wayland_protocols::ext::foreign_toplevel_list::v1::client::ext_foreign_toplevel_list_v1;
+```
+
+---
+
+## Enabling staging and unstable protocols
+
+The feature flags compose cleanly. Here is a reference `Cargo.toml` block for a client that uses stable, staging, and unstable protocols together:
+
+```toml
+[dependencies]
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = [
+    "client",
+    "staging",   # fractional-scale, session-lock, xdg-activation, etc.
+    "unstable",  # xdg-decoration, xdg-output, pointer-constraints, etc.
+] }
+```
+
+<Warning>
+Unstable protocols carry no stability guarantees. Interfaces prefixed with `z` (e.g. `zwp_`, `zxdg_`) may be removed or changed incompatibly in future versions of the upstream `wayland-protocols` repository.
+</Warning>

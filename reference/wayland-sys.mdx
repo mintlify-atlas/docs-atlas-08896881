@@ -1,0 +1,195 @@
+---
+title: "wayland-sys FFI bindings reference"
+sidebarTitle: "wayland-sys"
+description: "Reference for wayland-sys 0.31: raw unsafe FFI bindings to libwayland-client, libwayland-server, libwayland-cursor, and libwayland-egl shared libraries."
+---
+
+`wayland-sys` provides raw, unsafe FFI bindings to the system Wayland shared libraries: `libwayland-client`, `libwayland-server`, `libwayland-cursor`, and `libwayland-egl`. It is a foundational crate used internally by `wayland-backend`, `wayland-cursor`, and `wayland-egl` — but almost all application and library authors should use those higher-level crates instead of `wayland-sys` directly.
+
+<Note>
+Version covered by this reference: **0.31.11**. Full API documentation is available at [docs.rs/wayland-sys](https://docs.rs/wayland-sys/).
+</Note>
+
+<Warning>
+**Prefer `wayland-backend` for almost all use cases.** `wayland-sys` exposes raw C pointers and requires `unsafe` blocks throughout. Unless you are implementing a new backend, writing your own protocol library, or doing deep FFI interoperability work, use `wayland-backend` (or `wayland-client` / `wayland-server`) instead.
+</Warning>
+
+## Installation and features
+
+```toml
+[dependencies]
+wayland-sys = "0.31.11"
+```
+
+Because `wayland-sys` consists entirely of FFI bindings, you must enable the features corresponding to the libraries you want to bind:
+
+| Feature | System library | Description |
+|---|---|---|
+| `client` | `libwayland-client.so` | Raw bindings to the client-side Wayland library. Required by `cursor` and `egl`. |
+| `server` | `libwayland-server.so` | Raw bindings to the server-side Wayland library. |
+| `cursor` | `libwayland-cursor.so` | Raw bindings to cursor theme loading. Implies `client`. |
+| `egl` | `libwayland-egl.so` | Raw bindings to EGL window creation. Implies `client`. |
+| `dlopen` | *(runtime)* | Load libraries at runtime with `dlopen` instead of link-time. Allows graceful fallback when a library is absent. |
+| `libwayland_client_1_23` | — | Enable symbols present only in libwayland-client ≥ 1.23. |
+| `libwayland_server_1_22` | — | Enable symbols present only in libwayland-server ≥ 1.22. |
+| `libwayland_server_1_23` | — | Enable symbols present only in libwayland-server ≥ 1.23. Implies `libwayland_server_1_22`. |
+
+A typical configuration enabling client and server without runtime loading:
+
+```toml
+[dependencies]
+wayland-sys = { version = "0.31.11", features = ["client", "server"] }
+```
+
+## Module structure
+
+Each feature maps to a module containing all associated FFI types and function bindings:
+
+| Module | Feature | Contents |
+|---|---|---|
+| `wayland_sys::common` | *(always available)* | Core types shared by client and server: `wl_interface`, `wl_message`, `wl_array`, `wl_argument`, `wl_fixed_t`. |
+| `wayland_sys::client` | `client` | `wl_display_*`, `wl_proxy_*`, and all client-side C functions and types. |
+| `wayland_sys::server` | `server` | `wl_display_*`, `wl_resource_*`, `wl_global_*`, and all server-side C functions and types. |
+| `wayland_sys::cursor` | `cursor` + `client` | `wl_cursor_theme_*`, `wl_cursor_*`, `wl_cursor_image`. |
+| `wayland_sys::egl` | `egl` + `client` | `wl_egl_window_*` and the `wl_egl_window` type. |
+
+## The `ffi_dispatch!` macro
+
+All FFI calls must go through the `ffi_dispatch!` macro, which abstracts over the two linking modes (link-time vs. `dlopen`):
+
+```rust
+#[macro_use] extern crate wayland_sys;
+use wayland_sys::client::*;
+
+// Link-time mode (no `dlopen` feature):
+let display_ptr = unsafe {
+    ffi_dispatch!(wayland_client_handle(), wl_display_connect, std::ptr::null())
+};
+```
+
+The macro signature is:
+
+```rust
+ffi_dispatch!($handle: expr, $func: ident $(, $arg: expr)* $(,)?)
+```
+
+- **With `dlopen` feature**: `($handle.$func)($($arg),*)` — calls through a handle struct loaded at runtime.
+- **Without `dlopen` feature**: `$func($($arg),*)` — calls the linked C function directly.
+
+In both cases you must glob-import the relevant module (e.g. `use wayland_sys::client::*`) to bring all required symbols and the handle into scope.
+
+## The `dlopen` feature: runtime library loading
+
+Without `dlopen`, `wayland-sys` links against the Wayland libraries at build time. The binary will fail to start if the libraries are not installed.
+
+With `dlopen`, the libraries are loaded the first time a handle is accessed. Each module exposes an `is_lib_available()` function that returns `true` if the library was loaded successfully:
+
+```rust
+use wayland_sys::client;
+
+if !client::is_lib_available() {
+    eprintln!("libwayland-client.so not found — falling back to X11");
+    return;
+}
+```
+
+This is the mechanism that allows graphical applications to support both Wayland and X11 from a single binary without hard-linking either display library.
+
+<Tip>
+The `dlopen` feature is controlled on `wayland-sys`. The `wayland-backend` crate forwards it via its own `dlopen` feature: enabling `dlopen` on `wayland-backend` automatically enables it on `wayland-sys`.
+</Tip>
+
+## What `wayland-sys` provides
+
+`wayland-sys` exposes the C ABI as closely as possible, including:
+
+- **Type definitions** — `wl_display`, `wl_proxy`, `wl_resource`, `wl_interface`, `wl_message`, `wl_array`, `wl_fixed_t`, `wl_argument`, `wl_egl_window`, and more.
+- **C function bindings** — every public function from the targeted Wayland headers (e.g. `wl_display_connect`, `wl_proxy_marshal_flags`, `wl_resource_post_error`).
+- **Constants** — protocol error codes and other `#define` values from `wayland-client.h` and `wayland-server.h`.
+
+All functions are `unsafe` and require the caller to uphold C API contracts (valid pointers, correct object lifetimes, single-threaded access per the libwayland threading model).
+
+## When to use `wayland-sys` directly
+
+<Tabs>
+  <Tab title="Use wayland-sys when…">
+    - You are writing a **new backend** for `wayland-backend` or a similar low-level crate.
+    - You need to **interoperate with an existing C library** that takes `wl_display*` or `wl_proxy*` pointers.
+    - You are implementing **deep FFI** bridging between Rust and a C compositor or toolkit.
+    - You need access to **symbols not yet exposed** by the higher-level crates.
+  </Tab>
+  <Tab title="Use wayland-backend instead when…">
+    - You are writing a **Wayland client application** or library. Use `wayland-client`.
+    - You are writing a **Wayland compositor** or server-side library. Use `wayland-server`.
+    - You need to implement custom protocol extensions. Use `wayland-scanner` + `wayland-backend`.
+    - You want safe, idiomatic Rust without managing raw pointer lifetimes.
+  </Tab>
+</Tabs>
+
+## Build requirements
+
+`wayland-sys` uses `pkg-config` to locate the system Wayland development headers and libraries:
+
+| Library feature | Required pkg-config package |
+|---|---|
+| `client` | `wayland-client` |
+| `server` | `wayland-server` |
+| `cursor` | `wayland-cursor` |
+| `egl` | `wayland-egl` |
+
+On Debian/Ubuntu-based systems, install the development packages:
+
+```bash
+sudo apt-get install libwayland-dev
+```
+
+On Fedora/RHEL-based systems:
+
+```bash
+sudo dnf install wayland-devel
+```
+
+On Arch Linux:
+
+```bash
+sudo pacman -S wayland
+```
+
+<Note>
+When the `dlopen` feature is enabled, `pkg-config` is still used at build time to verify the headers exist, but the `.so` files are not linked into the binary — they are loaded at runtime. The development headers are still required to compile the crate.
+</Note>
+
+## Raw usage example
+
+The following example demonstrates the low-level pattern for connecting to a Wayland display using `wayland-sys` directly. In practice, use `wayland-client` instead.
+
+```rust
+#[macro_use]
+extern crate wayland_sys;
+
+use wayland_sys::client::*;
+use std::ptr;
+
+fn connect_raw() {
+    // Check that libwayland-client.so loaded successfully (only relevant with dlopen).
+    if !is_lib_available() {
+        panic!("libwayland-client.so not available");
+    }
+
+    // SAFETY: wl_display_connect accepts a null pointer to use $WAYLAND_DISPLAY.
+    let display = unsafe {
+        ffi_dispatch!(wayland_client_handle(), wl_display_connect, ptr::null())
+    };
+
+    if display.is_null() {
+        panic!("failed to connect to Wayland display");
+    }
+
+    // ... perform FFI operations on `display` ...
+
+    // SAFETY: display was successfully returned by wl_display_connect.
+    unsafe {
+        ffi_dispatch!(wayland_client_handle(), wl_display_disconnect, display);
+    }
+}
+```

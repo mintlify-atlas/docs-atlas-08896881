@@ -1,0 +1,194 @@
+---
+title: "OpenGL and EGL integration with wayland-egl"
+sidebarTitle: "EGL Integration"
+description: "wayland-egl wraps wl_egl_window to create EGL surfaces from Wayland WlSurface objects, enabling OpenGL and Vulkan rendering in clients."
+---
+
+The `wayland-egl` crate provides the thin bridge between a Wayland `wl_surface` and the EGL windowing system. OpenGL and Vulkan drivers do not understand Wayland surfaces directly — they need a `wl_egl_window` handle, a C struct allocated by `libwayland-egl` that the driver can use to present rendered frames. `wayland-egl` exposes this as [`WlEglSurface`]: a safe Rust type that creates and destroys the `wl_egl_window`, provides its raw pointer for passing to EGL initialization routines, and supports runtime resize operations.
+
+<Warning>
+`wayland-egl` links against `libwayland-egl.so` at compile time through the `client_system` feature of `wayland-backend`. You must have the EGL development headers and the Wayland EGL library installed on the build host.
+</Warning>
+
+## Adding the dependency
+
+Because `wayland-egl` delegates object-ID tracking to `wayland-backend` with the `client_system` feature, you only need one line in `Cargo.toml`:
+
+```toml
+[dependencies]
+wayland-egl = "0.32"
+```
+
+`wayland-backend` with `client_system` and `wayland-sys` with the `egl` feature are pulled in automatically as transitive dependencies.
+
+<Note>
+The `dlopen` feature on `wayland-backend` (and therefore `wayland-sys`) makes the system libraries load at runtime rather than being linked at compile time. You can combine this with `wayland-egl` if you want the EGL surface path to fail gracefully when `libwayland-egl.so` is absent — call `wayland_egl::is_available()` to check.
+</Note>
+
+## Checking library availability
+
+When the `dlopen` feature is active, the EGL library is loaded lazily. Call `is_available()` before creating any surface:
+
+```rust
+if !wayland_egl::is_available() {
+    eprintln!("libwayland-egl not found — cannot create EGL surface");
+    return;
+}
+```
+
+When `dlopen` is not active, `is_available()` always returns `true` because the library is linked directly.
+
+## Creating a `WlEglSurface`
+
+[`WlEglSurface::new()`] accepts an [`ObjectId`] obtained from a `WlSurface`, plus the initial pixel dimensions. It returns an error if the `ObjectId` does not correspond to a live `wl_surface` or if the dimensions are non-positive.
+
+```rust
+use wayland_egl::WlEglSurface;
+use wayland_client::{Connection, protocol::wl_surface::WlSurface};
+
+fn create_egl_surface(surface: &WlSurface, width: i32, height: i32) -> WlEglSurface {
+    // ObjectId::clone() is cheap — it is reference-counted internally.
+    WlEglSurface::new(surface.id(), width, height)
+        .expect("Failed to create WlEglSurface")
+}
+```
+
+<Note>
+You must always destroy the `WlEglSurface` **before** the underlying `wl_surface` protocol object is destroyed. Dropping `WlEglSurface` calls `wl_egl_window_destroy` automatically via its `Drop` implementation.
+</Note>
+
+## Getting the raw pointer for EGL initialization
+
+Most OpenGL/EGL binding crates (glutin, khronos-egl, raw EGL) need two pointers at context creation time:
+
+- **`EGLDisplay`** — obtained from the raw `wl_display` pointer via `Backend::display_ptr()`
+- **`EGLSurface` / native window** — obtained from `WlEglSurface::ptr()`
+
+```rust
+use wayland_egl::WlEglSurface;
+use wayland_backend::client::Backend;
+use std::os::raw::c_void;
+
+fn egl_pointers(backend: &Backend, egl_surface: &WlEglSurface) {
+    // wl_display* — pass to eglGetDisplay() as EGLNativeDisplayType.
+    let display_ptr: *mut c_void = backend.display_ptr().cast();
+
+    // wl_egl_window* — pass to eglCreateWindowSurface() as EGLNativeWindowType.
+    let window_ptr: *const c_void = egl_surface.ptr();
+
+    println!("EGL display ptr: {display_ptr:?}");
+    println!("EGL window ptr:  {window_ptr:?}");
+}
+```
+
+## Resizing the surface
+
+When the compositor sends a `wl_surface.configure` event with new dimensions, call [`WlEglSurface::resize()`]. The last two arguments, `dx` and `dy`, shift the top-left corner of the surface and can be set to `0` in the common case.
+
+```rust
+// Resize to 1280×720 without moving the origin.
+egl_surface.resize(1280, 720, 0, 0);
+```
+
+Query the current attached size at any time with [`WlEglSurface::get_size()`]:
+
+```rust
+let (w, h) = egl_surface.get_size();
+println!("Current EGL surface size: {w}×{h}");
+```
+
+## `raw-window-handle` integration
+
+`wayland-backend` implements [`HasDisplayHandle`][rwh_06::HasDisplayHandle] for `client::Backend` when both the `rwh_06` and `client_system` features are enabled. This lets you pass the display handle to crates such as `wgpu` or `winit` through the standard `raw-window-handle` API.
+
+To obtain a `RawWindowHandle` for the surface side you construct a `WaylandWindowHandle` from the `wl_egl_window` pointer:
+
+```rust
+#[cfg(feature = "rwh_06")]
+fn window_handle(egl_surface: &WlEglSurface) -> raw_window_handle::RawWindowHandle {
+    use raw_window_handle::{RawWindowHandle, WaylandWindowHandle};
+    use std::ptr::NonNull;
+
+    // WlEglSurface::ptr() returns *const c_void pointing to the wl_egl_window.
+    let ptr = NonNull::new(egl_surface.ptr() as *mut _).unwrap();
+    RawWindowHandle::Wayland(WaylandWindowHandle::new(ptr))
+}
+```
+
+## Combining with raw EGL calls
+
+<Tabs>
+  <Tab title="Raw EGL (khronos-egl)">
+```rust
+use wayland_egl::WlEglSurface;
+use wayland_backend::client::Backend;
+
+fn setup_egl(backend: &Backend, egl_surface: &WlEglSurface) {
+    // Obtain raw C pointers.
+    let display_ptr = backend.display_ptr(); // *mut wl_display
+    let window_ptr  = egl_surface.ptr();     // *const c_void (wl_egl_window*)
+
+    // --- Pass to khronos-egl (or any other EGL binding) ---
+    // let egl = egl::Instance::new(egl::Static);
+    // let egl_display = egl.get_display(display_ptr as _).unwrap();
+    // let egl_win_surface = egl.create_window_surface(
+    //     egl_display, config, window_ptr as _, None
+    // ).unwrap();
+    let _ = (display_ptr, window_ptr); // suppress unused warnings
+}
+```
+  </Tab>
+  <Tab title="glutin">
+```toml
+[dependencies]
+wayland-egl = "0.32"
+glutin = "0.32"
+raw-window-handle = "0.6"
+```
+
+```rust
+// With glutin you typically pass the display and window handles
+// through raw-window-handle traits rather than raw pointers.
+// Enable rwh_06 on wayland-backend:
+//
+//   wayland-backend = { version = "0.3", features = ["client_system", "rwh_06"] }
+//
+// Then glutin can obtain the EGLDisplay from `HasDisplayHandle`
+// and the EGLSurface from a `WaylandWindowHandle` built from egl_surface.ptr().
+```
+  </Tab>
+</Tabs>
+
+## Thread safety
+
+`WlEglSurface` implements `Send` — it can be moved to another thread after creation, which is useful when rendering on a dedicated thread. It is **not** `Sync` because the underlying `wl_egl_window*` pointer performs no internal synchronization. Do not share a reference to `WlEglSurface` across threads concurrently.
+
+## Error handling
+
+[`WlEglSurface::new()`] returns a `Result<WlEglSurface, wayland_egl::Error>`:
+
+| Variant | Cause |
+|---|---|
+| `Error::InvalidId` | The `ObjectId` is not a live `wl_surface` |
+| `Error::InvalidSize` | `width` or `height` is ≤ 0 |
+
+```rust
+use wayland_egl::{WlEglSurface, Error};
+
+match WlEglSurface::new(surface.id(), 0, 0) {
+    Ok(_)  => unreachable!(),
+    Err(Error::InvalidSize) => eprintln!("Width/height must be positive"),
+    Err(Error::InvalidId)   => eprintln!("Surface is already destroyed"),
+}
+```
+
+## API summary
+
+| Method | Description |
+|---|---|
+| `is_available()` | Check whether `libwayland-egl.so` could be loaded |
+| `WlEglSurface::new(id, width, height)` | Create an EGL window from a `wl_surface` `ObjectId` |
+| `WlEglSurface::ptr()` | Raw `*const c_void` for `eglCreateWindowSurface` |
+| `WlEglSurface::resize(w, h, dx, dy)` | Update the surface dimensions |
+| `WlEglSurface::get_size()` | Query the current `(width, height)` |
+| `Backend::display_ptr()` | Raw `*mut wl_display` for `eglGetDisplay` (system backend only) |

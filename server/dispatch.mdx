@@ -1,0 +1,347 @@
+---
+title: "Request dispatch and the Resource trait in wayland-server"
+sidebarTitle: "Dispatch"
+description: "The Dispatch and Resource traits drive request routing in wayland-server. Learn how to handle client requests and send events back to clients."
+---
+
+When a Wayland client sends a request, `wayland-server` routes it to your application logic through the `Dispatch` trait. Each Wayland object — called a *resource* on the server side — has an associated `Request` enum generated from the protocol XML. Your `State` struct implements `Dispatch<Resource, State>` for every resource type it handles, and `Display::dispatch_clients()` calls the appropriate implementation automatically. This page covers the full lifecycle: receiving requests, sending events back, posting fatal protocol errors, managing child objects, and avoiding reference cycles with `Weak<I>`.
+
+## The Dispatch trait
+
+```rust
+pub trait Dispatch<I: Resource, State> {
+    fn request(
+        &self,
+        state:     &mut State,
+        client:    &Client,
+        resource:  &I,
+        request:   I::Request,
+        dhandle:   &DisplayHandle,
+        data_init: &mut DataInit<'_, State>,
+    );
+
+    fn destroyed(
+        &self,
+        _state:    &mut State,
+        _client:   wayland_backend::server::ClientId,
+        _resource: &I,
+    ) {}
+}
+```
+
+`Dispatch` is implemented on the **user-data** type, not the state. The `self` receiver is the user-data stored alongside the resource. This makes it possible to have multiple `Dispatch` implementations for the same interface, differentiated by the user-data type — a key mechanism for building reusable Wayland handler libraries.
+
+### The request() method
+
+`request()` is invoked once per incoming client message. The parameters are:
+
+| Parameter | Type | Description |
+|---|---|---|
+| `state` | `&mut State` | Mutable reference to your compositor state |
+| `client` | `&Client` | The client that sent the request |
+| `resource` | `&I` | The resource the request was sent to |
+| `request` | `I::Request` | Enum variant for the specific request |
+| `dhandle` | `&DisplayHandle` | Handle for sending events and creating objects |
+| `data_init` | `&mut DataInit<'_, State>` | Used to initialize any child objects created by this request |
+
+### The destroyed() method
+
+`destroyed()` is called when the resource is destroyed — either because the client explicitly destroyed it or because the client disconnected. The default implementation is a no-op. Use it to clean up any server-side state tied to the resource.
+
+```rust
+impl Dispatch<WlSurface, AppState> for SurfaceData {
+    fn request(/* … */) { /* … */ }
+
+    fn destroyed(
+        &self,
+        state:    &mut AppState,
+        _client:  wayland_backend::server::ClientId,
+        resource: &WlSurface,
+    ) {
+        // Remove this surface from any internal tracking
+        state.surfaces.remove(&resource.id());
+    }
+}
+```
+
+## Handling requests: a wl_surface example
+
+```rust
+use wayland_server::{
+    Client, DataInit, Dispatch, DisplayHandle, Resource,
+    protocol::{
+        wl_buffer::WlBuffer,
+        wl_callback::WlCallback,
+        wl_surface::{self, WlSurface},
+    },
+};
+
+#[derive(Default)]
+pub struct SurfaceData {
+    pending_buffer: Option<WlBuffer>,
+}
+
+impl Dispatch<WlSurface, AppState> for SurfaceData {
+    fn request(
+        &self,
+        state:     &mut AppState,
+        _client:   &Client,
+        resource:  &WlSurface,
+        request:   wl_surface::Request,
+        dhandle:   &DisplayHandle,
+        data_init: &mut DataInit<'_, AppState>,
+    ) {
+        match request {
+            wl_surface::Request::Attach { buffer, x, y } => {
+                // `buffer` is Option<WlBuffer>
+                // store pending attachment in surface-local state
+            }
+
+            wl_surface::Request::Frame { callback } => {
+                // `callback` is a New<WlCallback> — must be initialized
+                let cb = data_init.init(callback, ());
+                // Store cb to send WlCallback::Done later
+                state.frame_callbacks.push(cb);
+            }
+
+            wl_surface::Request::Commit => {
+                // apply pending state to the surface
+            }
+
+            wl_surface::Request::Destroy => {
+                // protocol-level destroy; resource will be cleaned up automatically
+            }
+
+            _ => {}
+        }
+    }
+}
+```
+
+<Note>
+If a request creates a child object (indicated by a `New<I>` argument in the `Request` enum), you **must** call `data_init.init()` on it before `request()` returns. Forgetting to do so causes a panic.
+</Note>
+
+## The Resource trait
+
+Every generated Wayland interface type (e.g. `WlSurface`, `WlCompositor`) implements the `Resource` trait. It provides everything you need to inspect and interact with a protocol object.
+
+### Sending events
+
+```rust
+use wayland_server::Resource;
+use wayland_server::protocol::wl_output::{self, WlOutput};
+
+// Send a geometry event to a wl_output resource
+output.send_event(wl_output::Event::Geometry {
+    x: 0,
+    y: 0,
+    physical_width: 600,
+    physical_height: 340,
+    subpixel: wl_output::Subpixel::HorizontalRgb,
+    make: "Acme".into(),
+    model: "Monitor 3000".into(),
+    transform: wl_output::Transform::Normal,
+})?;
+```
+
+`send_event()` returns `Err(InvalidId)` if the resource is no longer alive. Events placed into the output buffer are not written to the socket immediately — call `Display::flush_clients()` or `DisplayHandle::flush_clients()` to push them out.
+
+### Posting protocol errors
+
+Protocol errors are fatal: the client's connection is terminated immediately after the error message is sent.
+
+```rust
+use wayland_server::protocol::wl_surface;
+
+// post_error() takes an error code (usually from the interface's Error enum)
+// and a human-readable message string.
+surface.post_error(
+    wl_surface::Error::InvalidSize as u32,
+    "surface dimensions must be positive",
+);
+```
+
+### Checking liveness
+
+```rust
+if resource.is_alive() {
+    // safe to send events or read data
+}
+```
+
+`is_alive()` returns `false` either after the resource has been protocol-destroyed or after the underlying Wayland connection has been closed.
+
+### Reading object metadata
+
+```rust
+// The ObjectId — a unique, stable identifier within the session
+let id: wayland_server::backend::ObjectId = resource.id();
+
+// The negotiated interface version
+let version: u32 = resource.version();
+
+// The Client that owns this resource (None if resource is dead)
+let client: Option<wayland_server::Client> = resource.client();
+```
+
+### Accessing user-data
+
+User-data is the value you passed to `DataInit::init()` when the resource was created. Access it from any code that holds a reference to the resource:
+
+```rust
+// Generic accessor — returns None if the type does not match
+if let Some(data) = surface.data::<SurfaceData>() {
+    println!("surface has {} pending buffers", data.pending_buffers);
+}
+```
+
+## DataInit: initializing child objects
+
+`DataInit` appears in both `Dispatch::request()` and `GlobalDispatch::bind()`. Its purpose is to assign user-data (and therefore a `Dispatch` implementation) to a freshly created resource before it becomes visible.
+
+```rust
+pub struct DataInit<'a, D: 'static> { /* … */ }
+
+impl<D> DataInit<'_, D> {
+    /// Initialize with Dispatch-compatible user data
+    pub fn init<I: Resource + 'static, U>(
+        &mut self,
+        resource: New<I>,
+        data: U,
+    ) -> I
+    where
+        U: Dispatch<I, D> + Send + Sync + 'static;
+
+    /// Initialize with a raw ObjectData implementation (bypass Dispatch)
+    pub fn custom_init<I: Resource + 'static>(
+        &mut self,
+        resource: New<I>,
+        data: Arc<dyn ObjectData<D>>,
+    ) -> I;
+
+    /// Post an error on an uninitialized object (only valid in GlobalDispatch::bind)
+    pub fn post_error<I: Resource + 'static>(
+        &mut self,
+        resource: New<I>,
+        code: impl Into<u32>,
+        error: impl Into<String>,
+    );
+}
+```
+
+`DataInit::init()` returns the fully initialized resource, which you can store or immediately send an event on:
+
+```rust
+wl_compositor::Request::CreateSurface { id } => {
+    let surface: WlSurface = data_init.init(id, SurfaceData::default());
+    // `surface` is now fully alive; you can send events to it or store it
+    state.surfaces.insert(surface.id(), surface);
+}
+```
+
+## DispatchError: BadMessage
+
+`DispatchError` has a single variant, `BadMessage`, which is generated when the underlying message received from the client does not match the specification for the object's interface — for example, a request opcode that does not exist or an argument of the wrong type.
+
+```rust
+pub enum DispatchError {
+    BadMessage {
+        sender_id: ObjectId,
+        interface: &'static str,
+        opcode:    u16,
+    },
+}
+```
+
+You do not need to handle `DispatchError` yourself. `wayland-server` catches it during request parsing, logs a warning, and kills the offending client with a protocol error. It surfaces in the type system as the return type of `Resource::parse_request()`, which is an implementation detail called by the generated code.
+
+## Weak\<I\>: non-owning resource references
+
+Storing a `Resource` handle in another resource's user-data creates a reference cycle — both objects keep each other alive indefinitely. `Weak<I>` breaks that cycle by holding a non-owning reference that does not prevent cleanup.
+
+```rust
+use wayland_server::Weak;
+use wayland_server::protocol::wl_surface::WlSurface;
+
+// Create a weak reference from any live resource
+let weak: Weak<WlSurface> = surface.downgrade();
+
+// Later, try to upgrade back to a full resource
+match weak.upgrade() {
+    Ok(surface) => {
+        surface.send_event(/* … */)?;
+    }
+    Err(_) => {
+        // The surface has already been destroyed
+    }
+}
+
+// Check liveness without upgrading
+if weak.is_alive() {
+    // …
+}
+```
+
+`Weak<I>` is `Clone`, `PartialEq`, `Eq`, and `Hash`. Clones share the same underlying identity.
+
+<Tip>
+Store `Weak<I>` instead of `I` whenever you need to reference a resource from the user-data of another resource. This avoids `Arc` cycles that prevent destructors from running and leak memory.
+</Tip>
+
+## Generic Dispatch implementations (delegation pattern)
+
+A common pattern in libraries like Smithay is to implement `Dispatch` generically over the last type parameter, allowing downstream code to delegate to a shared handler:
+
+```rust
+use wayland_server::{protocol::wl_output, Dispatch};
+
+/// A reusable wl_output handler.
+pub struct OutputHandler;
+
+/// Associated state that downstream compositors must provide.
+pub trait OutputHandlerState {
+    fn output_list(&mut self) -> &mut Vec<WlOutput>;
+}
+
+// Generic implementation — State can be any type satisfying the bounds.
+impl<State> Dispatch<wl_output::WlOutput, State> for OutputHandler
+where
+    OutputHandler: Dispatch<wl_output::WlOutput, State>,
+    State: OutputHandlerState,
+{
+    fn request(
+        &self,
+        state:     &mut State,
+        _client:   &wayland_server::Client,
+        resource:  &wl_output::WlOutput,
+        request:   wl_output::Request,
+        _dhandle:  &wayland_server::DisplayHandle,
+        _data_init: &mut wayland_server::DataInit<'_, State>,
+    ) {
+        // Downstream state is available via the trait bound
+        let outputs = state.output_list();
+        // handle request…
+    }
+}
+```
+
+This lets library crates ship a `Dispatch` implementation and require only a trait bound on `State`, rather than demanding a concrete state type.
+
+## Quick-reference
+
+| API | Description |
+|---|---|
+| `Dispatch::request()` | Handle an incoming client request |
+| `Dispatch::destroyed()` | Clean up when a resource is destroyed |
+| `resource.send_event(evt)` | Send a protocol event to the client |
+| `resource.post_error(code, msg)` | Send a fatal protocol error (disconnects client) |
+| `resource.is_alive()` | Check if the resource still exists |
+| `resource.version()` | Negotiated interface version |
+| `resource.id()` | Unique `ObjectId` for this resource |
+| `resource.client()` | `Option<Client>` that owns this resource |
+| `resource.data::<U>()` | Access typed user-data |
+| `resource.downgrade()` | Create a `Weak<I>` non-owning handle |
+| `data_init.init(new, data)` | Initialize a child resource |
+| `data_init.custom_init(new, arc)` | Initialize with raw `ObjectData` |
+| `weak.upgrade()` | Attempt to recover a full resource from `Weak<I>` |

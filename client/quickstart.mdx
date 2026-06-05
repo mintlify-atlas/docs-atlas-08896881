@@ -1,0 +1,217 @@
+---
+title: "Get started with wayland-client in Rust"
+sidebarTitle: "Quickstart"
+description: "Build a working Wayland client in Rust using wayland-client. Connect to a compositor, enumerate globals, and handle events in under 50 lines."
+---
+
+`wayland-client` provides safe, idiomatic Rust bindings for the Wayland client protocol. The library is structured around four core concepts: the `Connection` that owns the socket to the compositor, `EventQueue` instances that buffer and dispatch incoming events, proxy types that represent individual Wayland objects, and the `Dispatch` trait that routes events to your application logic. This guide walks through each of those pieces and ends with a complete, runnable example.
+
+## Prerequisites
+
+You need a Linux machine (or any system running a Wayland compositor) and a recent Rust toolchain. The minimum supported Rust version for `wayland-client 0.31` is **1.86**.
+
+## Add the dependency
+
+<Steps>
+
+### Add `wayland-client` to `Cargo.toml`
+
+Open your project's `Cargo.toml` and add `wayland-client` to `[dependencies]`:
+
+```toml
+[dependencies]
+wayland-client = "0.31"
+```
+
+`wayland-client` ships two optional Cargo features that control the underlying backend:
+
+| Feature | Effect |
+|---------|--------|
+| `system` | Links against the system `libwayland-client.so`. Required for FFI interop with other C libraries (e.g. `raw-window-handle`). |
+| `dlopen` | Dynamically loads `libwayland-client.so` at runtime instead of linking at compile time. Your binary starts successfully even when no Wayland library is installed—useful for shipping cross-platform binaries that gracefully fall back when running under X11 or Windows. |
+
+To enable both:
+
+```toml
+[dependencies]
+wayland-client = { version = "0.31", features = ["system", "dlopen"] }
+```
+
+<Note>
+If neither `system` nor `dlopen` is specified, `wayland-client` uses its own pure-Rust Wayland backend. That backend is fully functional but cannot share a connection with C code.
+</Note>
+
+### Connect to the compositor
+
+`Connection::connect_to_env()` reads the standard Wayland environment variables (`WAYLAND_SOCKET`, `WAYLAND_DISPLAY`, `XDG_RUNTIME_DIR`) and opens the socket:
+
+```rust
+use wayland_client::Connection;
+
+fn main() {
+    let conn = Connection::connect_to_env().unwrap();
+}
+```
+
+This single call is all you need for the vast majority of applications.
+
+### Create an `EventQueue` and get its `QueueHandle`
+
+An `EventQueue` buffers events read from the socket and dispatches them to your state. Every Wayland object you create must be assigned to a queue via a `QueueHandle` obtained from that queue:
+
+```rust
+let mut event_queue = conn.new_event_queue::<AppData>();
+let qh = event_queue.handle();
+```
+
+The type parameter `AppData` is your application state—the struct that will receive all dispatched events through `Dispatch` implementations.
+
+### Get `WlDisplay` and request the registry
+
+`WlDisplay` is the root Wayland object. From it you request a `WlRegistry`, which the server uses to advertise all available globals:
+
+```rust
+let display = conn.display();
+let _registry = display.get_registry(&qh, ());
+```
+
+The second argument to `get_registry` is the *user data* associated with this particular registry object. Here `()` suffices because we have no per-object state to track.
+
+### Implement `Dispatch` for `WlRegistry`
+
+For every Wayland object your application processes, you must implement `Dispatch<ObjectType, UserData>` for your state type. The `event()` method is called once per received event:
+
+```rust
+use wayland_client::{protocol::wl_registry, Connection, Dispatch, QueueHandle};
+
+struct AppData;
+
+impl Dispatch<wl_registry::WlRegistry, ()> for AppData {
+    fn event(
+        &mut self,
+        _: &wl_registry::WlRegistry,
+        event: wl_registry::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<AppData>,
+    ) {
+        if let wl_registry::Event::Global { name, interface, version } = event {
+            println!("[{name}] {interface} (v{version})");
+        }
+    }
+}
+```
+
+<Tip>
+The `Dispatch` trait's first type parameter is the proxy type (`WlRegistry`). The second is the user-data type you attached when the object was created—here `()`. You can have multiple `Dispatch` implementations for the same proxy type as long as the user-data types differ.
+</Tip>
+
+### Call `roundtrip` to receive the initial events
+
+`EventQueue::roundtrip()` flushes all pending outgoing messages to the server, then blocks until the server has processed them all and sent back a `wl_display.done` callback. During this time every `wl_registry.global` event is buffered and then dispatched to your `Dispatch` implementation:
+
+```rust
+event_queue.roundtrip(&mut AppData).unwrap();
+```
+
+Use `roundtrip` during program startup. For the main event loop, prefer `blocking_dispatch` or an async/epoll-based integration instead.
+
+</Steps>
+
+## Complete example
+
+The following is the `list_globals` example taken directly from the repository. It demonstrates all six steps above in under 80 lines, including the comments that explain each decision:
+
+```rust
+use wayland_client::{Connection, Dispatch, QueueHandle, protocol::wl_registry};
+
+// This struct represents the state of our app. This simple app does not
+// need any state, but this type still supports the `Dispatch` implementations.
+struct AppData;
+
+// Implement `Dispatch<WlRegistry, ()>` for our state. This provides the logic
+// to be able to process events for the wl_registry interface.
+//
+// The second type parameter is the user-data of our implementation. It is a
+// mechanism that allows you to associate a value to each particular Wayland
+// object, and allow different dispatching logic depending on the type of the
+// associated value.
+//
+// In this example, we just use () as we don't have any value to associate. See
+// the `Dispatch` documentation for more details about this.
+impl Dispatch<wl_registry::WlRegistry, AppData> for () {
+    fn event(
+        &self,
+        _: &mut AppData,
+        _: &wl_registry::WlRegistry,
+        event: wl_registry::Event,
+        _: &Connection,
+        _: &QueueHandle<AppData>,
+    ) {
+        // When receiving events from the wl_registry, we are only interested in the
+        // `global` event, which signals a new available global.
+        // When receiving this event, we just print its characteristics in this example.
+        if let wl_registry::Event::Global { name, interface, version } = event {
+            println!("[{name}] {interface} (v{version})");
+        }
+    }
+}
+
+// The main function of our program
+fn main() {
+    // Create a Wayland connection by connecting to the server through the
+    // environment-provided configuration.
+    let conn = Connection::connect_to_env().unwrap();
+
+    // Retrieve the WlDisplay Wayland object from the connection. This object is
+    // the starting point of any Wayland program, from which all other objects will
+    // be created.
+    let display = conn.display();
+
+    // Create an event queue for our event processing
+    let mut event_queue = conn.new_event_queue();
+    // And get its handle to associate new objects to it
+    let qh = event_queue.handle();
+
+    // Create a wl_registry object by sending the wl_display.get_registry request.
+    // This method takes two arguments: a handle to the queue the newly created
+    // wl_registry will be assigned to, and the user-data that should be associated
+    // with this registry (here it is () as we don't need user-data).
+    let _registry = display.get_registry(&qh, ());
+
+    // At this point everything is ready, and we just need to wait to receive the events
+    // from the wl_registry. Our callback will print the advertised globals.
+    println!("Advertised globals:");
+
+    // To actually receive the events, we invoke the `roundtrip` method. This method
+    // is special and you will generally only invoke it during the setup of your program:
+    // it will block until the server has received and processed all the messages you've
+    // sent up to now.
+    //
+    // In our case, that means it'll block until the server has received our
+    // wl_display.get_registry request, and as a reaction has sent us a batch of
+    // wl_registry.global events.
+    //
+    // `roundtrip` will then empty the internal buffer of the queue it has been invoked
+    // on, and thus invoke our `Dispatch` implementation that prints the list of advertised
+    // globals.
+    event_queue.roundtrip(&mut AppData).unwrap();
+}
+```
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Connection" href="/client/connection">
+    Deep-dive into `Connection`: alternate constructors, FFI interop, and error handling.
+  </Card>
+  <Card title="Event Queues" href="/client/event-queues">
+    Learn synchronous roundtrips, blocking dispatch, and multi-queue patterns.
+  </Card>
+  <Card title="Globals" href="/client/globals">
+    Use `GlobalList` and `registry_queue_init` to discover and bind compositor capabilities.
+  </Card>
+  <Card title="Dispatch" href="/client/dispatch">
+    Master `Dispatch` trait implementations for every object type your client uses.
+  </Card>
+</CardGroup>

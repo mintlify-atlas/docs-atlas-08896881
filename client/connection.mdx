@@ -1,0 +1,248 @@
+---
+title: "Managing Wayland connections with Connection"
+sidebarTitle: "Connection"
+description: "The Connection struct is the entry point to wayland-client. Learn how to open, configure, and close a connection to a Wayland compositor."
+---
+
+`Connection` is the heart of `wayland-client`. It owns the Unix socket that links your process to the Wayland compositor, serializes outgoing requests, and coordinates all event reads. Almost every other type in the library—`EventQueue`, proxy objects, `WlDisplay`—flows from a `Connection` instance. This page covers every way to create one, the backend feature flags that control the underlying implementation, and the error types you will encounter.
+
+## Opening a connection
+
+### `Connection::connect_to_env()`
+
+The standard entry point for any Wayland application. It reads the environment to find the compositor socket and opens it:
+
+```rust
+use wayland_client::Connection;
+
+fn main() {
+    let conn = Connection::connect_to_env().unwrap();
+    // conn is ready to use
+}
+```
+
+Internally the function checks the environment in this order:
+
+1. **`WAYLAND_SOCKET`** — if set, the value is treated as a raw file-descriptor integer that is already connected to the compositor. The variable is immediately unset so child processes do not inherit it, and `CLOEXEC` is applied to the fd.
+2. **`WAYLAND_DISPLAY`** — if set, its value is used as a socket path. If the path is relative, it is resolved under `XDG_RUNTIME_DIR`.
+3. If neither variable is present, the call returns `ConnectError::NoCompositor`.
+
+### `Connection::from_socket()`
+
+If you obtain a connected `UnixStream` through your own means (for example from a socket pair, or after authenticating with a session manager), pass it directly:
+
+```rust
+use std::os::unix::net::UnixStream;
+use wayland_client::Connection;
+
+let stream = UnixStream::connect("/run/user/1000/wayland-0").unwrap();
+let conn = Connection::from_socket(stream).unwrap();
+```
+
+### `Connection::from_backend()`
+
+For embedding in larger frameworks that already hold a `wayland-backend` `Backend` handle:
+
+```rust
+use wayland_client::{Connection, backend::Backend};
+
+// Backend obtained externally, e.g. from an FFI layer
+fn wrap(backend: Backend) -> Connection {
+    Connection::from_backend(backend)
+}
+```
+
+This is also the path for creating a `Connection` from a raw `*mut wl_display` pointer obtained from C code. First construct a `Backend` from the pointer using `Backend::from_foreign_display()` (a `wayland-backend` API), then wrap it with `from_backend()`.
+
+<Warning>
+`from_backend()` and `from_foreign_display()` require the `system` Cargo feature. Without it, only the pure-Rust backend is available and there is no `*mut wl_display` pointer to share with C code.
+</Warning>
+
+## `ConnectError` variants
+
+All constructors return `Result<Connection, ConnectError>`. The enum has three variants:
+
+| Variant | Meaning |
+|---------|---------|
+| `ConnectError::NoCompositor` | Neither `WAYLAND_SOCKET` nor `WAYLAND_DISPLAY` pointed to a reachable compositor socket. |
+| `ConnectError::NoWaylandLib` | The `dlopen` feature is active but `libwayland-client.so` could not be loaded at runtime. |
+| `ConnectError::InvalidFd` | `WAYLAND_SOCKET` was set but contained a value that could not be parsed as a valid file descriptor integer. |
+
+```rust
+use wayland_client::{Connection, ConnectError};
+
+match Connection::connect_to_env() {
+    Ok(conn) => { /* proceed */ }
+    Err(ConnectError::NoCompositor) => eprintln!("No Wayland compositor found"),
+    Err(ConnectError::NoWaylandLib)  => eprintln!("libwayland-client.so not available"),
+    Err(ConnectError::InvalidFd)     => eprintln!("WAYLAND_SOCKET contains garbage"),
+}
+```
+
+## Backend feature flags
+
+`wayland-client` supports two backend implementations, selected via Cargo features:
+
+<Tabs>
+  <Tab title="Pure-Rust backend (default)">
+    The default configuration uses a pure-Rust Wayland implementation. No system libraries are required at compile time or at runtime.
+
+    ```toml
+    [dependencies]
+    wayland-client = "0.31"
+    ```
+
+    **Limitation:** The `*mut wl_display` and `*mut wl_proxy` C pointers are not available. You cannot interoperate with other C Wayland libraries (e.g. Mesa's EGL) using this backend.
+  </Tab>
+  <Tab title="system feature">
+    Links directly against `libwayland-client.so`. Enables FFI interop: you can retrieve raw C pointers via `ObjectId::as_ptr()` and pass them to other libraries.
+
+    ```toml
+    [dependencies]
+    wayland-client = { version = "0.31", features = ["system"] }
+    ```
+
+    Use this when you need `raw-window-handle` support, when embedding in a GTK/Qt application, or when integrating with any other C Wayland consumer.
+  </Tab>
+  <Tab title="dlopen feature">
+    Like `system`, but dynamically loads `libwayland-client.so` at *runtime* rather than linking at compile time. The binary can start on systems without Wayland installed and gracefully degrade.
+
+    ```toml
+    [dependencies]
+    wayland-client = { version = "0.31", features = ["system", "dlopen"] }
+    ```
+
+    <Tip>
+    `dlopen` implies `system`. When the load fails, `Connection::connect_to_env()` returns `ConnectError::NoWaylandLib`, which you can use to fall back to a different display system (X11, software renderer, etc.).
+    </Tip>
+  </Tab>
+</Tabs>
+
+## Key methods
+
+### `conn.display()`
+
+Returns the `WlDisplay` singleton for this connection. `WlDisplay` is the root object of every Wayland session; all other objects are created from it:
+
+```rust
+let display = conn.display();
+// display: protocol::wl_display::WlDisplay
+```
+
+### `conn.new_event_queue()`
+
+Creates a new `EventQueue` tied to this connection. Pass the queue's `QueueHandle` when creating Wayland objects to assign them to that queue:
+
+```rust
+let mut queue = conn.new_event_queue::<MyState>();
+let qh = queue.handle();
+
+let _registry = conn.display().get_registry(&qh, ());
+```
+
+You can create as many event queues as you need. See [Event Queues](/client/event-queues) for multi-queue patterns.
+
+### `conn.flush()`
+
+Writes all pending outgoing messages to the socket. Many dispatch methods flush implicitly, but if you build requests without immediately dispatching you should call `flush` to ensure the compositor receives them:
+
+```rust
+conn.flush().unwrap();
+```
+
+### `conn.roundtrip()`
+
+A lower-level roundtrip that does *not* dispatch events through an `EventQueue`. It blocks until the server has processed all outgoing requests. Useful when you hold a `Connection` reference but not a mutable `EventQueue`:
+
+```rust
+conn.roundtrip().unwrap();
+```
+
+For most cases, prefer `EventQueue::roundtrip()`, which combines the wait with event dispatch.
+
+### `conn.prepare_read()`
+
+Returns a `ReadEventsGuard` for integrating with custom event loops (epoll, io-uring, etc.). The guard holds a reference to the connection's file descriptor; call `guard.read()` once the fd is readable, then flush any newly enqueued events with `EventQueue::dispatch_pending()`.
+
+```rust
+if let Some(guard) = conn.prepare_read() {
+    // wait for guard.connection_fd() to be readable, then:
+    guard.read().unwrap();
+}
+```
+
+### `conn.set_max_buffer_size()` (feature-gated)
+
+Available when the `libwayland_1_23` feature is enabled. Caps the internal send buffer to protect against runaway clients:
+
+```rust
+#[cfg(feature = "libwayland_1_23")]
+conn.set_max_buffer_size(Some(4 * 1024 * 1024)); // 4 MiB
+```
+
+Pass `None` to restore the default.
+
+### `conn.protocol_error()`
+
+Returns the last protocol error recorded by the compositor, if any. Once a protocol error occurs the connection is dead; use this to produce a human-readable diagnostic:
+
+```rust
+if let Some(err) = conn.protocol_error() {
+    eprintln!(
+        "Protocol error on object {}@{}: {} (code {})",
+        err.interface, err.object_id, err.message, err.code
+    );
+}
+```
+
+## Handling `WaylandError`
+
+Methods that perform I/O (flush, roundtrip, dispatch) return `Result<_, WaylandError>`. The error has two variants:
+
+```rust
+use wayland_client::backend::WaylandError;
+
+match conn.flush() {
+    Ok(()) => {}
+    Err(WaylandError::Io(io_err)) => {
+        eprintln!("I/O error: {io_err}");
+    }
+    Err(WaylandError::Protocol(proto_err)) => {
+        eprintln!(
+            "Protocol error {}: {}",
+            proto_err.code, proto_err.message
+        );
+        // The connection is permanently broken at this point.
+    }
+}
+```
+
+`WaylandError::Protocol` signals that the compositor sent an error event. The connection cannot be recovered; you should shut down cleanly.
+
+## Using `Connection` with FFI
+
+When the `system` feature is enabled, you can extract C pointers for use with other libraries:
+
+```rust
+use wayland_client::{Connection, Proxy};
+
+let conn = Connection::connect_to_env().unwrap();
+let display = conn.display();
+
+// Get the underlying *mut wl_display
+let id = display.id();
+let raw_display = id.as_ptr(); // *mut wl_display
+
+// Pass raw_display to EGL, Mesa, or any other C Wayland library
+```
+
+Going in the other direction—wrapping a `*mut wl_display` obtained from C—requires `Backend::from_foreign_display()` from `wayland-backend`, then `Connection::from_backend()`.
+
+## `Connection` is cheaply cloneable
+
+`Connection` implements `Clone`. All clones share the same underlying socket and backend state via reference counting. You can freely pass clones to threads, store them in structs, or hand them to helper functions without worrying about lifetimes:
+
+```rust
+let conn1 = Connection::connect_to_env().unwrap();
+let conn2 = conn1.clone(); // same socket, new handle
+```

@@ -1,0 +1,229 @@
+---
+title: "wayland-cursor API reference for cursor theme loading"
+sidebarTitle: "wayland-cursor"
+description: "Reference for wayland-cursor 0.31: CursorTheme, Cursor, and CursorImageBuffer types for loading XCursor images from system themes."
+---
+
+`wayland-cursor` provides a pure-Rust re-implementation of the `libwayland-cursor` functionality. It reads XCursor theme files from the system, selects the appropriate image size, uploads cursor pixel data into a Wayland shared-memory pool, and exposes `WlBuffer` handles you can attach directly to a `wl_surface`. Animated cursors are fully supported via a frame-timing API.
+
+<Note>
+Version covered by this reference: **0.31.14**. Full API documentation is available at [docs.rs/wayland-cursor](https://docs.rs/wayland-cursor/).
+</Note>
+
+## Installation
+
+```toml
+[dependencies]
+wayland-cursor = "0.31.14"
+# wayland-client is a required transitive dependency; you likely already have it
+wayland-client = "0.31"
+```
+
+No additional system libraries are required — `wayland-cursor` uses `rustix` for shared-memory management and `xcursor` for parsing XCursor files.
+
+## `CursorTheme`
+
+`CursorTheme` represents a fully loaded cursor theme. It owns the Wayland shared-memory pool into which all cursor images are uploaded. You create one per Wayland connection and reuse it for all cursor lookups.
+
+```rust
+pub struct CursorTheme { /* private */ }
+```
+
+### Constructors
+
+| Method | Signature | Description |
+|---|---|---|
+| `load` | `fn load(conn: &Connection, shm: WlShm, size: u32) -> Result<Self, InvalidId>` | Load from system defaults. Reads `XCURSOR_THEME` and `XCURSOR_SIZE` environment variables; falls back to the `"default"` theme. |
+| `load_or` | `fn load_or(conn: &Connection, shm: WlShm, name: &str, size: u32) -> Result<Self, InvalidId>` | Load using `name` as the fallback theme if `XCURSOR_THEME` is not set. |
+| `load_from_name` | `fn load_from_name(conn: &Connection, shm: WlShm, name: &str, size: u32) -> Result<Self, InvalidId>` | Load a specific named theme, ignoring all environment variables. |
+
+`load` is equivalent to `load_or(conn, shm, "default", size)`. All three constructors create the backing `wl_shm_pool` via the provided `WlShm` global and return `Err(InvalidId)` only if the `WlShm` object is no longer valid.
+
+### Methods
+
+```rust
+impl CursorTheme {
+    pub fn get_cursor(&mut self, name: &str) -> Option<&Cursor>;
+    pub fn set_fallback<F>(&mut self, fallback: F)
+    where
+        F: Fn(&str, u32) -> Option<Cow<'static, [u8]>> + Send + Sync + 'static;
+}
+```
+
+| Method | Description |
+|---|---|
+| `get_cursor(name)` | Look up a cursor by its XCursor name (e.g. `"default"`, `"wait"`, `"crosshair"`). Returns `None` if neither the theme nor any parent theme provides it. Lazily parses and uploads on first call. |
+| `set_fallback(f)` | Register a closure that is called with `(name, size)` when a cursor is missing from the system theme. The closure should return the raw bytes of an XCursor file, or `None` to decline. |
+
+<Tip>
+The `XCURSOR_THEME` and `XCURSOR_SIZE` environment variables are read at `load` / `load_or` call time. Set them before creating your `CursorTheme` if you need to override them programmatically.
+</Tip>
+
+## `Cursor`
+
+A `Cursor` holds one or more `CursorImageBuffer` frames. Static cursors have exactly one frame; animated cursors have multiple, each with an associated display duration.
+
+```rust
+#[derive(Debug, Clone)]
+pub struct Cursor { /* private */ }
+```
+
+### Methods
+
+```rust
+impl Cursor {
+    pub fn frame_and_duration(&self, millis: u32) -> FrameAndDuration;
+    pub fn image_count(&self) -> usize;
+}
+```
+
+| Method | Signature | Description |
+|---|---|---|
+| `frame_and_duration` | `fn frame_and_duration(&self, millis: u32) -> FrameAndDuration` | Given the elapsed time in milliseconds since the animation started, returns which frame to display and how many milliseconds remain until the next frame. Time wraps automatically over the full animation duration. |
+| `image_count` | `fn image_count(&self) -> usize` | Returns the total number of frames in this cursor. |
+
+### Indexing
+
+`Cursor` implements `Index<usize>` — use array indexing to retrieve a specific frame as a `CursorImageBuffer`:
+
+```rust
+let buffer: &CursorImageBuffer = &cursor[frame_index];
+```
+
+### `FrameAndDuration`
+
+```rust
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct FrameAndDuration {
+    /// The index of the frame to display.
+    pub frame_index: usize,
+    /// Milliseconds for which this frame should remain visible.
+    pub frame_duration: u32,
+}
+```
+
+## `CursorImageBuffer`
+
+A single frame of cursor pixel data, backed by a `WlBuffer` in the shared-memory pool. `CursorImageBuffer` derefs to `WlBuffer`, so you can attach it directly to a `wl_surface`.
+
+```rust
+#[derive(Debug, Clone)]
+pub struct CursorImageBuffer { /* private */ }
+```
+
+### Methods
+
+```rust
+impl CursorImageBuffer {
+    pub fn dimensions(&self) -> (u32, u32);
+    pub fn hotspot(&self) -> (u32, u32);
+    pub fn delay(&self) -> u32;
+}
+```
+
+| Method | Return type | Description |
+|---|---|---|
+| `dimensions()` | `(u32, u32)` | Pixel width and height of this frame as `(width, height)`. |
+| `hotspot()` | `(u32, u32)` | Position of the pointer hotspot within the image as `(xhot, yhot)`. |
+| `delay()` | `u32` | Display duration of this frame in milliseconds (same value as `FrameAndDuration::frame_duration`). |
+
+`CursorImageBuffer` derefs to `WlBuffer`:
+
+```rust
+impl Deref for CursorImageBuffer {
+    type Target = WlBuffer;
+    fn deref(&self) -> &WlBuffer { ... }
+}
+```
+
+<Warning>
+The `WlBuffer` backing each `CursorImageBuffer` is managed internally by `wayland-cursor`. Do not call `wl_buffer.destroy()` on it directly.
+</Warning>
+
+## Animation loop pattern
+
+For animated cursors, use `frame_and_duration` to drive a frame-advance loop. Record a start time, then on each iteration compute elapsed milliseconds and ask the cursor which frame to show.
+
+```rust
+use std::time::{Duration, Instant};
+use wayland_cursor::CursorTheme;
+
+fn run_cursor_loop(
+    cursor_surface: &wayland_client::protocol::wl_surface::WlSurface,
+    cursor: &wayland_cursor::Cursor,
+) {
+    let start_time = Instant::now();
+    loop {
+        let millis = start_time.elapsed().as_millis() as u32;
+        let fr_info = cursor.frame_and_duration(millis);
+
+        let buffer = &cursor[fr_info.frame_index];
+        let hotspot = buffer.hotspot();
+        cursor_surface.attach(Some(buffer), 0, 0);
+        cursor_surface.damage(0, 0, i32::MAX, i32::MAX);
+        cursor_surface.commit();
+
+        std::thread::sleep(Duration::from_millis(fr_info.frame_duration as u64));
+    }
+}
+```
+
+For static cursors, `image_count()` returns `1` and `frame_and_duration` always returns `frame_index: 0`.
+
+## Complete usage example
+
+The following example shows the full lifecycle: connecting to Wayland, obtaining the `wl_shm` global, loading a theme, looking up a cursor, and attaching its buffer to a surface.
+
+```rust
+use wayland_client::{Connection, protocol::wl_shm::WlShm};
+use wayland_cursor::CursorTheme;
+use std::time::{Instant, Duration};
+
+fn example(
+    connection: &Connection,
+    shm: WlShm,
+    cursor_surface: &wayland_client::protocol::wl_surface::WlSurface,
+) {
+    // Load the default cursor theme at 24 logical pixels.
+    // Respects the XCURSOR_THEME / XCURSOR_SIZE environment variables.
+    let mut cursor_theme = CursorTheme::load(connection, shm, 24)
+        .expect("failed to create shm pool for cursor theme");
+
+    // Look up the "default" cursor (the standard pointer arrow).
+    let cursor = cursor_theme
+        .get_cursor("default")
+        .expect("theme does not provide a 'default' cursor");
+
+    // Run an animation loop.
+    let start = Instant::now();
+    loop {
+        let elapsed_ms = start.elapsed().as_millis() as u32;
+        let fr = cursor.frame_and_duration(elapsed_ms);
+
+        let buf = &cursor[fr.frame_index];
+        let (hx, hy) = buf.hotspot();
+
+        // Attach the buffer and set the hotspot via wl_pointer.set_cursor.
+        cursor_surface.attach(Some(buf), 0, 0);
+        cursor_surface.commit();
+
+        // Sleep until the frame expires. In a real app, integrate with your
+        // event loop timer instead.
+        std::thread::sleep(Duration::from_millis(fr.frame_duration as u64));
+    }
+}
+```
+
+<Tip>
+Use `set_fallback` to embed a minimal cursor image in your binary as a last resort when the system theme is incomplete:
+
+```rust
+cursor_theme.set_fallback(|name, _size| {
+    if name == "default" {
+        Some(std::borrow::Cow::Borrowed(include_bytes!("../assets/default.xcur")))
+    } else {
+        None
+    }
+});
+```
+</Tip>

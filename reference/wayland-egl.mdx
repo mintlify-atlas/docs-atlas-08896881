@@ -1,0 +1,175 @@
+---
+title: "wayland-egl API reference for EGL surface creation"
+sidebarTitle: "wayland-egl"
+description: "Reference for wayland-egl 0.32: WlEglSurface wraps wl_egl_window for OpenGL and Vulkan surface creation in Wayland clients."
+---
+
+`wayland-egl` provides a safe Rust wrapper around `libwayland-egl`'s `wl_egl_window` type. A `WlEglSurface` is the bridge between a Wayland `wl_surface` and an EGL or Vulkan rendering context. Once created, you pass its raw pointer to your graphics library (e.g. `eglCreateWindowSurface`) to obtain a renderable surface.
+
+<Note>
+Version covered by this reference: **0.32.11**. Full API documentation is available at [docs.rs/wayland-egl](https://docs.rs/wayland-egl/).
+</Note>
+
+## Installation
+
+`wayland-egl` requires `libwayland-egl.so` to be present on the target system and delegates to `wayland-backend` with the `client_system` feature for obtaining raw `wl_proxy` pointers. Both dependencies are pulled in automatically.
+
+```toml
+[dependencies]
+wayland-egl = "0.32.11"
+```
+
+Because `wayland-egl` depends on `wayland-backend` with `client_system`, **your project will link against `libwayland-client.so` and `libwayland-egl.so`** at build time (unless `dlopen` is also enabled in `wayland-backend`).
+
+<Warning>
+`WlEglSurface` requires the `client_system` backend — it obtains the native `wl_proxy*` pointer from the `ObjectId` via the system backend's `as_ptr()` method. The pure-Rust (`rs`) backend does not expose raw C pointers.
+</Warning>
+
+### Runtime availability check
+
+Before creating any surface, verify that `libwayland-egl.so` is loadable:
+
+```rust
+if !wayland_egl::is_available() {
+    eprintln!("libwayland-egl is not available on this system");
+    return;
+}
+```
+
+## `WlEglSurface`
+
+`WlEglSurface` is a thin, safe wrapper around `wl_egl_window`. It is `Send` (can be moved to another thread) but not `Sync` (cannot be shared across threads without synchronization), matching the semantics of the underlying C type.
+
+```rust
+#[derive(Debug)]
+pub struct WlEglSurface { /* private: *mut wl_egl_window */ }
+```
+
+`WlEglSurface` implements `Drop`, which calls `wl_egl_window_destroy` automatically.
+
+### Constructor
+
+```rust
+impl WlEglSurface {
+    pub fn new(surface: ObjectId, width: i32, height: i32) -> Result<Self, Error>;
+}
+```
+
+| Parameter | Type | Description |
+|---|---|---|
+| `surface` | `ObjectId` | The `ObjectId` of an active `wl_surface`. Must have interface name `"wl_surface"`. |
+| `width` | `i32` | Initial width of the EGL window in pixels. Must be `> 0`. |
+| `height` | `i32` | Initial height of the EGL window in pixels. Must be `> 0`. |
+
+Returns `Err(Error::InvalidId)` if the `ObjectId` is expired or does not refer to a `wl_surface`, and `Err(Error::InvalidSize)` if either dimension is `<= 0`.
+
+#### Advanced: raw pointer constructor
+
+```rust
+pub unsafe fn new_from_raw(
+    surface: NonNull<wl_proxy>,
+    width: i32,
+    height: i32,
+) -> Result<Self, Error>;
+```
+
+For interoperability with other libraries that already hold a raw `*mut wl_proxy`. The caller must guarantee the pointer is a valid `wl_surface` from `libwayland-client`.
+
+### Methods
+
+```rust
+impl WlEglSurface {
+    pub fn ptr(&self) -> *const c_void;
+    pub fn resize(&self, width: i32, height: i32, dx: i32, dy: i32);
+    pub fn get_size(&self) -> (i32, i32);
+}
+```
+
+| Method | Return type | Description |
+|---|---|---|
+| `ptr()` | `*const c_void` | The raw `wl_egl_window*` pointer cast to `*const c_void`. Pass this to `eglCreateWindowSurface` or `vkCreateWaylandSurfaceKHR`. |
+| `resize(width, height, dx, dy)` | `()` | Resize the EGL window. `(dx, dy)` is the displacement of the top-left corner, allowing directional control of resize operations (e.g. left-edge resize uses positive `dx`). |
+| `get_size()` | `(i32, i32)` | Fetch the currently attached size as `(width, height)`. |
+
+### `Error` type
+
+```rust
+#[derive(Debug)]
+pub enum Error {
+    /// Surface width or height are <= 0.
+    InvalidSize,
+    /// Passed surface object is not a surface or is expired.
+    InvalidId,
+}
+```
+
+`Error` implements `std::error::Error` and `Display`.
+
+## How to use with EGL
+
+Creating an EGL rendering surface for a Wayland client involves three layers:
+
+1. **Wayland surface** — a `wl_surface` protocol object (managed by `wayland-client`).
+2. **EGL window** — a `WlEglSurface` wrapping that `wl_surface` (this crate).
+3. **EGL surface** — created by your EGL library using the pointers from both.
+
+The typical flow is:
+
+```
+wl_surface (ObjectId)
+    └─► WlEglSurface::new(id, w, h)
+            └─► eglCreateWindowSurface(egl_display, config, wl_egl_surface.ptr(), ...)
+                    └─► EGLSurface  (OpenGL rendering target)
+```
+
+You also need the EGL display pointer, which comes from `eglGetDisplay` using the `wl_display*` pointer (available via `ObjectId::as_ptr()` on the display ID in the system backend).
+
+## Complete usage example
+
+The following example creates a `WlEglSurface`, hands it to a hypothetical EGL library for context setup, renders a frame, then resizes when the window changes dimensions.
+
+```rust
+use wayland_backend::client::ObjectId;
+use wayland_egl::WlEglSurface;
+
+fn setup_egl_surface(surface_id: ObjectId) -> WlEglSurface {
+    // Check that libwayland-egl.so is present before attempting surface creation.
+    assert!(
+        wayland_egl::is_available(),
+        "libwayland-egl.so is not available"
+    );
+
+    // Create the EGL window at an initial 800×600 resolution.
+    let egl_surface = WlEglSurface::new(surface_id, 800, 600)
+        .expect("failed to create WlEglSurface");
+
+    // At this point, egl_surface.ptr() can be passed to your EGL library:
+    //
+    //   let egl_window_surface = egl.create_window_surface(
+    //       egl_display,
+    //       egl_config,
+    //       egl_surface.ptr() as _,
+    //       &[EGL_NONE],
+    //   );
+
+    egl_surface
+}
+
+fn handle_resize(egl_surface: &WlEglSurface, new_width: i32, new_height: i32) {
+    // Resize the EGL window. The final two arguments (dx, dy) indicate how
+    // the top-left corner should shift. For a centered resize, pass (0, 0).
+    egl_surface.resize(new_width, new_height, 0, 0);
+
+    // Confirm the new size.
+    let (w, h) = egl_surface.get_size();
+    println!("EGL surface is now {}×{}", w, h);
+}
+```
+
+<Tip>
+Always destroy the `WlEglSurface` **before** destroying the underlying `wl_surface` protocol object. `WlEglSurface` implements `Drop` automatically, so this means ensuring it goes out of scope or is explicitly dropped before you destroy the `wl_surface`.
+</Tip>
+
+<Note>
+`WlEglSurface` is `Send` — you can create it on one thread and move it to a render thread. It is not `Sync`, so simultaneous access from multiple threads requires external synchronization (e.g. a `Mutex`).
+</Note>

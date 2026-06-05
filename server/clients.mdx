@@ -1,0 +1,344 @@
+---
+title: "Managing client connections in wayland-server"
+sidebarTitle: "Clients"
+description: "Learn how wayland-server tracks connected clients, retrieves their credentials, disconnects them, and uses ListeningSocket to accept new connections."
+---
+
+A Wayland compositor must accept incoming client connections, track the state of each connected client, and clean up gracefully when a client disconnects. In `wayland-server`, this is handled by three cooperating types: `ListeningSocket` manages the Unix-domain socket that clients connect to, `Client` represents an individual connected client with its credentials and per-client data, and the `ClientData` trait lets you attach custom state to each connection. This page covers all three, together with `DisconnectReason` and the credential-based access patterns that `can_view()` enables.
+
+## ListeningSocket
+
+`ListeningSocket` creates and owns a named Unix-domain socket inside `$XDG_RUNTIME_DIR`. It also acquires an exclusive lockfile alongside the socket, preventing two compositor instances from accidentally sharing the same name. The socket file and lockfile are both deleted when the `ListeningSocket` is dropped.
+
+### Binding a socket
+
+<CodeGroup>
+```rust bind() — explicit name
+use wayland_server::ListeningSocket;
+
+// Creates $XDG_RUNTIME_DIR/wayland-0 (and a wayland-0.lock file)
+let socket = ListeningSocket::bind("wayland-0")?;
+println!("Listening on {:?}", socket.socket_name());
+```
+```rust bind_auto() — first free slot
+// Try wayland-1, wayland-2, … wayland-9 in order
+let socket = ListeningSocket::bind_auto("wayland", 1..=9)?;
+println!("Got {:?}", socket.socket_name());
+```
+```rust bind_absolute() — full path
+use std::path::PathBuf;
+
+// Bind at an arbitrary path (lockfile goes alongside it)
+let socket = ListeningSocket::bind_absolute(
+    PathBuf::from("/run/user/1000/my-compositor.sock"),
+)?;
+```
+</CodeGroup>
+
+`socket_name()` returns `Some(&OsStr)` only when the socket was created via `bind()` or `bind_auto()`. It returns `None` for sockets created with `bind_absolute()`.
+
+### BindError variants
+
+| Variant | Meaning |
+|---|---|
+| `RuntimeDirNotSet` | `$XDG_RUNTIME_DIR` is not set or is not an absolute path |
+| `PermissionDenied` | Cannot create files in `$XDG_RUNTIME_DIR` |
+| `AlreadyInUse` | Another process holds the lockfile for that name |
+| `Io(io::Error)` | Any other I/O failure |
+
+### Accepting connections
+
+`ListeningSocket::accept()` is non-blocking. It returns `Ok(Some(UnixStream))` when a new client is waiting, or `Ok(None)` if no client is ready. The returned `UnixStream` must be passed to `DisplayHandle::insert_client()` to register the client with the compositor — a stream that is never inserted will leave the client hanging indefinitely.
+
+```rust
+// In your event loop, poll the socket fd for readability first,
+// then call accept():
+if let Some(stream) = socket.accept()? {
+    let client_data = std::sync::Arc::new(MyClientData::new());
+    let client = display.handle().insert_client(stream, client_data)?;
+    println!("New client: {:?}", client.id());
+}
+```
+
+`ListeningSocket` implements both `AsRawFd` and `AsFd`, so you can poll it alongside the `Display` fd in your event loop:
+
+```rust
+use std::os::unix::io::AsFd;
+
+// Pass socket.as_fd() to epoll / calloop / mio / etc.
+let listening_fd = socket.as_fd();
+```
+
+## The Client struct
+
+`Client` represents a connected Wayland client. You receive `&Client` in `Dispatch::request()`, `GlobalDispatch::bind()`, and `GlobalDispatch::can_view()`. You can also retrieve a client from a `DisplayHandle` given an `ObjectId`.
+
+```rust
+use wayland_server::backend::ObjectId;
+
+// From a known ObjectId (e.g., the id of a resource):
+let client = dh.get_client(object_id)?;
+
+// From within a Dispatch impl — client is passed directly:
+fn request(/* … */, client: &Client, /* … */) {
+    println!("Request from {:?}", client.id());
+}
+```
+
+### client.id()
+
+Returns the `ClientId` — an opaque, stable identifier for this connection during its lifetime. `ClientId` is `Clone`, `PartialEq`, and `Eq`.
+
+```rust
+let id: wayland_server::backend::ClientId = client.id();
+```
+
+### client.get_credentials()
+
+Returns the kernel-level `pid`, `uid`, and `gid` of the process on the other end of the socket.
+
+```rust
+use wayland_server::backend::Credentials;
+
+let creds: Credentials = client.get_credentials(&dh)?;
+println!("pid={} uid={} gid={}", creds.pid, creds.uid, creds.gid);
+```
+
+<Warning>
+Credentials can be spoofed by a sufficiently privileged process. Do not use them as the *sole* security mechanism for privileged protocols. See the [Weston discussion](https://gitlab.freedesktop.org/wayland/weston/-/issues/206) for context.
+</Warning>
+
+### client.get_data()
+
+Retrieves the `ClientData` value you provided when calling `insert_client()`. Returns `None` if the type parameter does not match the actual stored type.
+
+```rust
+if let Some(data) = client.get_data::<MyClientData>() {
+    println!("session id: {}", data.session_id);
+}
+```
+
+### client.kill()
+
+Terminates the client connection immediately by sending a protocol error. The client's `ClientData::disconnected()` callback is invoked with `DisconnectReason::ProtocolError`.
+
+```rust
+use wayland_server::backend::protocol::ProtocolError;
+
+client.kill(
+    &dh,
+    ProtocolError {
+        code: 0,
+        object_id: 1,
+        object_interface: "wl_display".into(),
+        message: "You are not welcome here".into(),
+    },
+);
+```
+
+### Optional: client.global_name() and client.set_max_buffer_size()
+
+```rust
+// Requires the `libwayland_1_22` feature:
+let name: Option<u32> = client.global_name(&dh, global_id);
+
+// Requires the `libwayland_1_23` feature:
+client.set_max_buffer_size(&dh, 4 * 1024 * 1024); // 4 MiB
+```
+
+## The ClientData trait
+
+`ClientData` is defined in `wayland_backend` and re-exported from `wayland_server::backend`. Implement it on a type to attach custom per-client state and receive lifecycle notifications.
+
+```rust
+pub trait ClientData: Any + Send + Sync {
+    fn initialized(&self, _client_id: ClientId) {}
+    fn disconnected(&self, _client_id: ClientId, _reason: DisconnectReason) {}
+}
+```
+
+Both methods have default no-op implementations, so you only need to override the ones you care about.
+
+```rust
+use wayland_server::backend::{ClientData, ClientId, DisconnectReason};
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
+
+struct MyClientData {
+    session_id: u32,
+}
+
+impl ClientData for MyClientData {
+    fn initialized(&self, client_id: ClientId) {
+        println!("Client {:?} connected (session {})", client_id, self.session_id);
+    }
+
+    fn disconnected(&self, client_id: ClientId, reason: DisconnectReason) {
+        match reason {
+            DisconnectReason::ConnectionClosed => {
+                println!("Client {:?} closed cleanly", client_id);
+            }
+            DisconnectReason::ProtocolError(err) => {
+                println!(
+                    "Client {:?} killed: {} (code {})",
+                    client_id, err.message, err.code
+                );
+            }
+        }
+    }
+}
+```
+
+Pass the `ClientData` implementation to `insert_client()` wrapped in an `Arc`:
+
+```rust
+let client_data = Arc::new(MyClientData { session_id: 42 });
+let client = display.handle().insert_client(stream, client_data)?;
+```
+
+## DisconnectReason
+
+`DisconnectReason` describes why a client connection ended. It is passed to `ClientData::disconnected()`.
+
+```rust
+pub enum DisconnectReason {
+    /// The connection was closed by the client or the OS (clean shutdown, SIGPIPE, etc.)
+    ConnectionClosed,
+    /// The server terminated the connection with a protocol error
+    ProtocolError(ProtocolError),
+}
+```
+
+`ProtocolError` carries the error `code`, the numeric `object_id` of the affected resource, the `object_interface` name, and a human-readable `message` string.
+
+## Using credentials in can_view()
+
+A typical use of client credentials is restricting a privileged global (e.g. an XWayland-only protocol) to connections whose `pid` matches a known process. The `can_view()` method of `GlobalDispatch` is the right place for this check.
+
+```rust
+use wayland_server::{
+    Client, DataInit, DisplayHandle, GlobalDispatch, New,
+    protocol::wl_compositor::WlCompositor,
+};
+
+pub struct XWaylandGlobal {
+    dh: DisplayHandle,
+    xwayland_pid: u32,
+}
+
+impl GlobalDispatch<WlCompositor, AppState> for XWaylandGlobal {
+    fn bind(
+        &self,
+        _state:    &mut AppState,
+        _handle:   &DisplayHandle,
+        _client:   &Client,
+        resource:  New<WlCompositor>,
+        data_init: &mut DataInit<'_, AppState>,
+    ) {
+        data_init.init(resource, ());
+    }
+
+    fn can_view(&self, client: &Client) -> bool {
+        // Only the XWayland process (identified by PID) may see this global.
+        client
+            .get_credentials(&self.dh)
+            .map(|creds| creds.pid == self.xwayland_pid)
+            .unwrap_or(false)
+    }
+}
+```
+
+A more complete pattern stores the `DisplayHandle` and per-compositor policy in the global data:
+
+```rust
+pub struct PolicyGlobal {
+    dh: DisplayHandle,
+    allowed_uids: Vec<u32>,
+}
+
+impl GlobalDispatch<WlCompositor, AppState> for PolicyGlobal {
+    fn bind(
+        &self,
+        _state:    &mut AppState,
+        _handle:   &DisplayHandle,
+        _client:   &Client,
+        resource:  New<WlCompositor>,
+        data_init: &mut DataInit<'_, AppState>,
+    ) {
+        data_init.init(resource, ());
+    }
+
+    fn can_view(&self, client: &Client) -> bool {
+        client
+            .get_credentials(&self.dh)
+            .map(|creds| self.allowed_uids.contains(&creds.uid))
+            .unwrap_or(false)
+    }
+}
+```
+
+## Full example: accept loop with credential logging
+
+```rust
+use std::sync::Arc;
+use wayland_server::{
+    Display, ListeningSocket,
+    backend::{ClientData, ClientId, Credentials, DisconnectReason},
+};
+
+struct TrackedClient {
+    credentials: Option<Credentials>,
+}
+
+impl ClientData for TrackedClient {
+    fn initialized(&self, id: ClientId) {
+        if let Some(creds) = &self.credentials {
+            println!(
+                "Client {:?} initialized: pid={} uid={} gid={}",
+                id, creds.pid, creds.uid, creds.gid
+            );
+        }
+    }
+    fn disconnected(&self, id: ClientId, reason: DisconnectReason) {
+        println!("Client {:?} disconnected: {:?}", id, reason);
+    }
+}
+
+fn run(mut display: Display<()>, socket: ListeningSocket) {
+    let dh = display.handle();
+
+    loop {
+        if let Some(stream) = socket.accept().unwrap() {
+            // Insert with a placeholder first so we can get the Client handle
+            let placeholder = Arc::new(TrackedClient { credentials: None });
+            if let Ok(client) = display.handle().insert_client(stream, placeholder) {
+                // Retrieve credentials now that the client is registered
+                let creds = client.get_credentials(&dh).ok();
+                println!("Accepted client: {:?} (creds: {:?})", client.id(), creds);
+            }
+        }
+
+        display.dispatch_clients(&mut ()).unwrap();
+        display.flush_clients().unwrap();
+    }
+}
+```
+
+## Quick-reference
+
+| API | Description |
+|---|---|
+| `ListeningSocket::bind(name)` | Bind to `$XDG_RUNTIME_DIR/{name}` |
+| `ListeningSocket::bind_auto(base, range)` | Auto-select first free `{base}-{n}` |
+| `ListeningSocket::bind_absolute(path)` | Bind at an arbitrary filesystem path |
+| `socket.accept()` | Non-blocking accept; returns `Option<UnixStream>` |
+| `socket.socket_name()` | Name used at bind time (`None` for `bind_absolute`) |
+| `dh.insert_client(stream, data)` | Register a client with the display |
+| `client.id()` | Opaque `ClientId` |
+| `client.get_credentials(&dh)` | Returns `Credentials { pid, uid, gid }` |
+| `client.get_data::<T>()` | Downcast stored `ClientData` |
+| `client.kill(&dh, error)` | Terminate client with protocol error |
+| `ClientData::initialized()` | Called after client is registered |
+| `ClientData::disconnected()` | Called when client disconnects |
+| `DisconnectReason::ConnectionClosed` | Clean disconnect |
+| `DisconnectReason::ProtocolError(e)` | Server-initiated kill |

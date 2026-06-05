@@ -1,0 +1,254 @@
+---
+title: "The Display and DisplayHandle types in wayland-server"
+sidebarTitle: "Display"
+description: "Display<D> is the heart of a Wayland compositor. Learn how to create it, integrate it into an event loop, and use DisplayHandle for protocol operations."
+---
+
+Every `wayland-server` compositor revolves around two closely related types: `Display<D>` and `DisplayHandle`. `Display<D>` owns the Wayland protocol backend and must be driven from your event loop — it is the type you call `dispatch_clients()` and `flush_clients()` on. `DisplayHandle` is a clonable, type-erased handle derived from the display that you pass to functions needing to interact with the protocol (creating globals, sending events, looking up clients). Because `DisplayHandle` erases the state type `D`, it can be stored in data structures and passed across code boundaries without carrying the full generic parameter.
+
+## Creating a Display
+
+`Display::new()` is the only constructor. It can fail only when both the `server_system` and `dlopen` Cargo features are enabled and the `libwayland-server.so` library cannot be found at runtime.
+
+```rust
+use wayland_server::Display;
+
+struct State {
+    // compositor fields …
+}
+
+let mut display: Display<State> = Display::new()
+    .expect("Failed to initialise Wayland display");
+```
+
+The state type `D` must be `'static`. Borrow checker rules mean that during `dispatch_clients()` the display holds an exclusive borrow on `D`, so the state struct itself does not need to implement any special traits beyond being `'static`.
+
+## Obtaining a DisplayHandle
+
+`Display::handle()` returns a `DisplayHandle`. The handle clones cheaply and does not keep the `Display` alive.
+
+```rust
+let dh: wayland_server::DisplayHandle = display.handle();
+
+// Clone it freely — each clone shares the same underlying connection
+let dh2 = dh.clone();
+```
+
+<Tip>
+Store `DisplayHandle` in resource user-data or global state so that handlers that only receive `&DisplayHandle` can still create objects or send events without needing the full `Display`.
+</Tip>
+
+## Dispatching client requests
+
+`Display::dispatch_clients()` reads all pending data from every connected client socket and calls the appropriate `Dispatch` implementations on your state. Call it whenever the display's file descriptor becomes readable.
+
+```rust
+// In your event loop iteration:
+display.dispatch_clients(&mut state)?;
+```
+
+The method returns the total number of dispatched messages, or an `io::Error`. Messages that do not map to a valid request cause the offending client to be killed with a protocol error — they do not bubble up as Rust errors here.
+
+## Flushing outgoing events
+
+Sending an event with `resource.send_event()` places data into an internal per-client output buffer. Call `flush_clients()` to drain those buffers into the corresponding Unix sockets.
+
+```rust
+// After dispatching (or after sending events unconditionally):
+display.flush_clients()?;
+```
+
+<Warning>
+Forgetting to call `flush_clients()` means clients will never receive the events your compositor sent. Call it at least once per event loop iteration, after `dispatch_clients()`.
+</Warning>
+
+## Integrating into an event loop
+
+The canonical integration pattern is to:
+
+1. Poll the display file descriptor for readability.
+2. Poll the `ListeningSocket` file descriptor for new connections.
+3. Dispatch and flush inside the readable branch.
+
+`Display` implements `AsFd`, so it works directly with `epoll`, `kqueue`, or any Rust event-loop crate that accepts `AsFd`.
+
+<Tabs>
+  <Tab title="Manual poll loop">
+```rust
+use std::os::unix::io::AsFd;
+use wayland_server::{Display, ListeningSocket};
+
+fn event_loop(
+    mut display: Display<State>,
+    socket: ListeningSocket,
+    mut state: State,
+) -> std::io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+
+    loop {
+        // Use any poll/epoll/select mechanism you prefer.
+        // Here we use a simplistic busy-loop for illustration.
+
+        // 1. Accept new client connections
+        if let Some(stream) = socket.accept()? {
+            let client_data = std::sync::Arc::new(MyClientData);
+            display.handle().insert_client(stream, client_data)?;
+        }
+
+        // 2. Dispatch all pending requests
+        display.dispatch_clients(&mut state)?;
+
+        // 3. Flush events back to clients
+        display.flush_clients()?;
+    }
+}
+```
+  </Tab>
+  <Tab title="With calloop">
+```rust
+// calloop 0.14 example (popular choice in Smithay-based compositors)
+use calloop::{EventLoop, LoopHandle};
+use wayland_server::Display;
+
+fn setup_event_loop(display: Display<State>) -> std::io::Result<()> {
+    let mut event_loop: EventLoop<State> = EventLoop::try_new()?;
+    let handle: LoopHandle<State> = event_loop.handle();
+
+    // Insert the display fd into calloop using its Generic source
+    use calloop::generic::Generic;
+    use calloop::Interest;
+    handle.insert_source(
+        Generic::new(display, Interest::READ, calloop::Mode::Level),
+        |_, display, state| {
+            display.dispatch_clients(state)?;
+            Ok(calloop::PostAction::Continue)
+        },
+    )?;
+
+    // event_loop.run(…) drives everything
+    Ok(())
+}
+```
+  </Tab>
+</Tabs>
+
+### Getting the poll file descriptor
+
+If you need the raw file descriptor to pass to `epoll_ctl` or similar:
+
+```rust
+use std::os::unix::io::AsFd;
+
+// AsFd on Display delegates to Backend::poll_fd()
+let poll_fd = display.as_fd();
+```
+
+Alternatively, access the backend directly:
+
+```rust
+let backend = display.backend();
+let poll_fd = backend.poll_fd();
+```
+
+## DisplayHandle operations
+
+`DisplayHandle` is the primary API surface for compositor logic that runs outside of `Display`. All methods are available through `display.handle()` or any clone of it.
+
+### Creating globals
+
+```rust
+use wayland_server::backend::GlobalId;
+use wayland_server::protocol::wl_compositor::WlCompositor;
+
+// Returns a GlobalId you can use to disable or remove the global later
+let global_id: GlobalId = dh.create_global::<State, WlCompositor, _>(4, ());
+```
+
+See [Advertising globals](/server/globals) for the full `GlobalDispatch` story.
+
+### Disabling and removing globals
+
+```rust
+// Soft removal: clients that already know about the global can still bind it,
+// but new clients will not see it in wl_registry.
+dh.disable_global::<State>(global_id.clone());
+
+// Hard removal: frees the global's state. Clients binding it afterwards
+// receive a protocol error. Prefer disable → (wait a few seconds) → remove
+// to avoid a race with clients that just looked up the global.
+dh.remove_global::<State>(global_id);
+```
+
+<Warning>
+Removing a global without first disabling it creates a race condition: a client may attempt to bind a global at the exact moment the server removes it. Always disable first and remove after a short delay.
+</Warning>
+
+### Looking up clients
+
+```rust
+use wayland_server::backend::ObjectId;
+
+// From an ObjectId (e.g. obtained from a resource):
+let client = dh.get_client(some_object_id)?;
+
+// From a resource directly:
+if let Some(client) = resource.client() {
+    println!("Request from client {:?}", client.id());
+}
+```
+
+### Sending events and posting errors
+
+```rust
+// High-level — prefer this:
+resource.send_event(wl_surface::Event::Enter { output: &output })?;
+
+// Low-level via DisplayHandle:
+dh.send_event(&resource, wl_surface::Event::Enter { output: &output })?;
+
+// Trigger a fatal protocol error on a resource (disconnects the client):
+dh.post_error(&resource, wl_surface::Error::InvalidScale as u32, "scale must be positive".into());
+```
+
+### Optional features
+
+<CodeGroup>
+```rust libwayland_1_23 feature
+// Cap the amount of data a single client may buffer server-side.
+// Requires the `libwayland_1_23` Cargo feature.
+dh.set_default_max_buffer_size(4 * 1024 * 1024); // 4 MiB
+```
+```rust libwayland_1_22 feature (per-client)
+// Per-client cap. Requires `libwayland_1_22` feature.
+client.set_max_buffer_size(&dh, 2 * 1024 * 1024);
+```
+</CodeGroup>
+
+## Accessing the backend
+
+For FFI interop (e.g. passing `*mut wl_display` to Mesa), access the backend through `Display::backend()`:
+
+```rust
+// Retrieve the raw wl_display pointer (system feature required)
+#[cfg(feature = "system")]
+{
+    let ptr = display.backend().handle().display_ptr();
+    // ptr: *mut wl_display — valid as long as Display lives
+}
+```
+
+## Summary
+
+| Method | Where | Purpose |
+|---|---|---|
+| `Display::new()` | `Display<D>` | Create the compositor display |
+| `Display::handle()` | `Display<D>` | Obtain a `DisplayHandle` |
+| `Display::dispatch_clients(&mut D)` | `Display<D>` | Process all incoming requests |
+| `Display::flush_clients()` | `Display<D>` | Write events to sockets |
+| `Display::backend()` | `Display<D>` | Access the raw backend for FFI |
+| `DisplayHandle::create_global()` | `DisplayHandle` | Advertise a new global |
+| `DisplayHandle::disable_global()` | `DisplayHandle` | Soft-remove a global |
+| `DisplayHandle::remove_global()` | `DisplayHandle` | Hard-remove a global |
+| `DisplayHandle::get_client()` | `DisplayHandle` | Look up a client by object ID |
+| `DisplayHandle::send_event()` | `DisplayHandle` | Send a protocol event (low-level) |
+| `DisplayHandle::post_error()` | `DisplayHandle` | Post a fatal protocol error |

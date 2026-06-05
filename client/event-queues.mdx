@@ -1,0 +1,248 @@
+---
+title: "Event queues and dispatch in wayland-client"
+sidebarTitle: "Event Queues"
+description: "EventQueue drives Wayland event dispatch in wayland-client. Learn synchronous roundtrips, blocking dispatch, and multi-queue patterns."
+---
+
+`EventQueue` is the machinery that turns raw bytes from the Wayland socket into structured calls to your application logic. Every event your compositor sends travels through at least one event queue before reaching your `Dispatch` implementation. Understanding exactly how events flow through the queue—and how to drive that flow—is the key to writing responsive, correct Wayland clients.
+
+## How event delivery works
+
+Receiving and processing Wayland events is a deliberate two-step process:
+
+1. **Read step** — raw event bytes are read from the compositor socket. For each message, `wayland-client` determines which `EventQueue` owns the target object and pushes the message into that queue's internal `VecDeque` buffer.
+2. **Dispatch step** — the queue drains its buffer, invoking `Dispatch::event()` on your state struct for each message in order.
+
+The two steps are intentionally decoupled. Multiple threads can participate in the read step concurrently (guarded by `ReadEventsGuard`), while the dispatch step always happens on the thread that owns `&mut State`. This design gives you `&mut State` access in every event handler without any locks.
+
+## Creating a queue
+
+Call `Connection::new_event_queue()` with your state type as the generic parameter:
+
+```rust
+use wayland_client::Connection;
+
+let conn = Connection::connect_to_env().unwrap();
+let mut event_queue = conn.new_event_queue::<MyState>();
+```
+
+Then get a `QueueHandle` and use it when creating Wayland objects:
+
+```rust
+let qh = event_queue.handle();
+let _registry = conn.display().get_registry(&qh, ());
+```
+
+Every object created with `&qh` will have its events delivered to `event_queue`.
+
+## Driving the queue
+
+### `roundtrip` — startup synchronization
+
+`EventQueue::roundtrip()` sends a `wl_display.sync` request, blocks until the compositor acknowledges it, and dispatches all events received in the meantime. Because the compositor processes requests in order, a roundtrip guarantees that all requests you sent before it have been acted upon:
+
+```rust
+let mut state = MyState::default();
+event_queue.roundtrip(&mut state).unwrap();
+```
+
+Use `roundtrip` during initialization to wait for the initial `wl_registry.global` flood, for surface configuration acknowledgements, and for any other "send requests, then wait for the server to catch up" patterns. In the main event loop, prefer `blocking_dispatch` instead.
+
+### `blocking_dispatch` — simple main loop
+
+`EventQueue::blocking_dispatch()` is the workhorse of a single-queue application. It:
+
+1. Dispatches any events already buffered in the queue.
+2. If the queue was empty, flushes outgoing messages and sleeps until at least one new event arrives.
+3. Dispatches that newly arrived batch.
+
+```rust
+while state.running {
+    event_queue.blocking_dispatch(&mut state).unwrap();
+}
+```
+
+This is the simplest possible main loop. It puts the thread to sleep between events so it does not busy-loop.
+
+### `dispatch_pending` — non-blocking drain
+
+`dispatch_pending` processes whatever is already in the queue's internal buffer without touching the socket. Use it in multi-source event loops where something else is responsible for reading the socket:
+
+```rust
+// After your custom socket read:
+event_queue.dispatch_pending(&mut state).unwrap();
+```
+
+It returns the number of events dispatched and never blocks.
+
+### `flush` — explicit send
+
+Force all outgoing Wayland requests to be written to the socket. Several dispatch methods do this automatically, but if you are building requests without immediately dispatching you should call flush manually:
+
+```rust
+event_queue.flush().unwrap();
+```
+
+## `QueueHandle`
+
+`QueueHandle<State>` is a lightweight, `Clone`able handle to a queue. You pass it when creating new Wayland objects so the library knows which queue should receive their events:
+
+```rust
+let qh: QueueHandle<MyState> = event_queue.handle();
+
+// All events for `registry` go to `event_queue`
+let registry = conn.display().get_registry(&qh, ());
+```
+
+`QueueHandle` is `Send + Sync`—you can clone it and share it across threads. Each clone refers to the same underlying queue.
+
+### `QueueHandle::make_data()`
+
+For advanced cases where you need a raw `ObjectData` handle compatible with the `wayland-backend` API but still want events routed through `Dispatch`, use `make_data()`:
+
+```rust
+use wayland_client::Proxy;
+
+let object_data = qh.make_data::<wl_registry::WlRegistry, _>(my_user_data);
+// Pass object_data to Proxy::send_constructor(...)
+```
+
+## `QueueFreezeGuard` — pausing dispatch
+
+`QueueHandle::freeze()` returns a `QueueFreezeGuard` that prevents the queue from dispatching events until all guards are dropped. Events continue to accumulate in the internal buffer; they are released in order when the freeze ends:
+
+```rust
+{
+    let _freeze = qh.freeze();
+    // Dispatch is paused—events buffer up.
+    do_atomic_setup();
+} // _freeze dropped here → dispatch resumes
+```
+
+This is useful when you need to perform a series of protocol operations that must be treated as a unit before any events leak through to your state.
+
+## Custom event-loop integration with `ReadEventsGuard`
+
+For applications that multiplex Wayland with other I/O sources (timers, D-Bus, file watches), use `prepare_read()` to integrate the Wayland socket into your existing event loop:
+
+```rust
+loop {
+    // 1. Write outgoing messages
+    event_queue.flush().unwrap();
+
+    // 2. Drain any events already buffered by other threads
+    event_queue.dispatch_pending(&mut state).unwrap();
+
+    // 3. Prepare for a coordinated socket read
+    let read_guard = event_queue.prepare_read().unwrap();
+
+    // 4. Poll or epoll on read_guard.connection_fd() alongside your other fds
+    let wayland_ready = poll_fd(read_guard.connection_fd());
+
+    if wayland_ready {
+        // 5a. Read new events into the internal buffer
+        read_guard.read().unwrap();
+        // 6. Dispatch what was just buffered
+        event_queue.dispatch_pending(&mut state).unwrap();
+    } else {
+        // 5b. Drop the guard to cancel the read preparation
+        drop(read_guard);
+    }
+}
+```
+
+<Note>
+`prepare_read()` returns `None` if events are already queued internally (for example because another thread read from the socket). In that case, call `dispatch_pending()` immediately and try `prepare_read()` again on the next iteration.
+</Note>
+
+`ReadEventsGuard` is re-exported from `wayland_client::backend`:
+
+```rust
+use wayland_client::backend::ReadEventsGuard;
+```
+
+## Async dispatch with `poll_dispatch_pending`
+
+`EventQueue` also exposes a `poll_dispatch_pending()` method compatible with `std::task::Poll`. It processes all currently buffered events and registers a waker so the current task is notified when new events arrive:
+
+```rust
+use futures_util::future::{poll_fn, select, Either};
+
+async fn run(data: &mut Data, mut wl_queue: EventQueue<Data>) {
+    loop {
+        match poll_fn(|cx| wl_queue.poll_dispatch_pending(cx, data)).await {
+            Ok(never) => match never {},
+            Err(e) => panic!("dispatch error: {e}"),
+        }
+    }
+}
+```
+
+<Note>
+For a batteries-included async/calloop integration, the `calloop-wayland-source` crate wraps an `EventQueue` as a calloop event source. This functionality was part of `wayland-client` itself up to version 0.30 but was extracted into a separate crate in 0.31.0.
+</Note>
+
+## Multiple event queues
+
+Using more than one event queue lets you separate concerns, process events on different threads, or isolate library code from application code.
+
+### One queue per thread
+
+Each thread creates its own `EventQueue` and runs its own dispatch loop. Because `blocking_dispatch` reads from the socket internally, the two threads will independently block and wake as events arrive:
+
+```rust
+use std::thread;
+use wayland_client::Connection;
+
+let conn = Connection::connect_to_env().unwrap();
+
+// Thread A handles wl_seat events
+let conn_a = conn.clone();
+let thread_a = thread::spawn(move || {
+    let mut queue_a = conn_a.new_event_queue::<SeatState>();
+    // ... create seat objects with queue_a's handle ...
+    let mut state = SeatState::new();
+    loop {
+        queue_a.blocking_dispatch(&mut state).unwrap();
+    }
+});
+
+// Thread B handles wl_output events
+let mut queue_b = conn.new_event_queue::<OutputState>();
+// ... create output objects with queue_b's handle ...
+let mut state = OutputState::new();
+loop {
+    queue_b.blocking_dispatch(&mut state).unwrap();
+}
+```
+
+### Guest library pattern
+
+If your code is a library sitting on top of a shared connection managed by a host application, do not read the socket yourself. Use only `dispatch_pending()` so your queue drains the events the host has already buffered, without interfering with the host's event loop:
+
+```rust
+// Called periodically by the host application's event loop
+pub fn tick(&mut self) {
+    self.event_queue.dispatch_pending(&mut self.state).unwrap();
+}
+```
+
+## Error handling
+
+All dispatch methods return `Result<usize, DispatchError>`, where the `usize` is the number of events processed. `DispatchError` has two variants:
+
+```rust
+use wayland_client::DispatchError;
+
+match event_queue.blocking_dispatch(&mut state) {
+    Ok(n) => println!("dispatched {n} events"),
+    Err(DispatchError::BadMessage { sender_id, interface, opcode }) => {
+        eprintln!("Malformed message on {interface}@{sender_id}, opcode {opcode}");
+    }
+    Err(DispatchError::Backend(backend_err)) => {
+        eprintln!("Backend/IO error: {backend_err}");
+    }
+}
+```
+
+`BadMessage` means the server sent an event that does not match the expected wire format for the interface. `Backend` wraps a `WaylandError` (either an I/O error or a compositor-issued protocol error).

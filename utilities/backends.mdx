@@ -1,0 +1,254 @@
+---
+title: "Choosing between pure-Rust and system Wayland backends"
+sidebarTitle: "Backends"
+description: "wayland-backend provides two protocol implementations: a pure-Rust backend and a system backend using libwayland. Learn when and how to use each."
+---
+
+`wayland-backend` is the lowest-level crate in the wayland-rs stack. It implements the Wayland wire protocol — serialising and deserialising messages, tracking object lifetimes, and dispatching events to user-supplied callbacks — in two interchangeable implementations called *backends*. The `rs` module contains a pure-Rust implementation that has no native dependencies. The `sys` module wraps the system `libwayland-client` and `libwayland-server` libraries for situations where you need to share a Wayland connection with C code or require behavioural parity with the reference implementation. Both backends expose an identical API, so switching between them is a compile-time decision that does not require source changes in most programs.
+
+## The two backends
+
+<Tabs>
+  <Tab title="rs — Pure Rust">
+The `rs` module implements the Wayland binary protocol entirely in Rust. It reads and writes Unix domain socket messages, parses the wire format, and calls `ObjectData` callbacks without touching any C library.
+
+```rust
+// Always available — no feature flag required.
+use wayland_backend::rs::client::Backend;
+use wayland_backend::rs::server::Backend as ServerBackend;
+```
+
+Prefer the `rs` backend when you want a single static binary, when running unit tests or CI without a Wayland installation, or when targeting embedded systems where `libwayland` is not available.
+  </Tab>
+  <Tab title="sys — System libwayland">
+The `sys` module delegates to `libwayland-client` or `libwayland-server` through FFI. It provides additional methods (such as `Backend::display_ptr()`, `ObjectId::as_ptr()`, and `Backend::from_foreign_display()`) that are only meaningful when the underlying C library manages the connection.
+
+```rust
+// Requires the `client_system` Cargo feature.
+use wayland_backend::sys::client::Backend;
+
+// Requires the `server_system` Cargo feature.
+use wayland_backend::sys::server::Backend as ServerBackend;
+```
+
+**When to prefer the `sys` backend:**
+Prefer the `sys` backend when you need to pass a raw `wl_display*` pointer to EGL or Vulkan, when embedding wayland-rs inside a C compositor that already owns the `wl_display`, or when you need exact libwayland behavior for protocol-level compatibility testing.
+  </Tab>
+</Tabs>
+
+## Automatic backend selection
+
+You rarely interact with `wayland_backend::rs` or `wayland_backend::sys` directly. Both `wayland-client` and `wayland-server` re-export the backend that is currently active as their top-level `client` / `server` modules. The selection rule is simple:
+
+- If the `client_system` feature is enabled anywhere in the dependency tree, the `sys` client backend is used; otherwise the `rs` backend is used.
+- The same applies for `server_system` on the server side.
+
+```rust
+// In wayland-client and wayland-server, these always point to the active backend:
+use wayland_backend::client::Backend;   // rs::client or sys::client
+use wayland_backend::server::Backend;   // rs::server or sys::server
+```
+
+This means you can write code against `wayland_backend::client` and let a downstream crate (such as `wayland-egl`, which requires `client_system`) transparently upgrade the whole dependency tree to the system backend without any source changes on your part.
+
+## Cargo features
+
+<CodeGroup>
+```toml Client features
+[dependencies.wayland-backend]
+version = "0.3"
+features = [
+    # Link against libwayland-client (enables sys::client).
+    "client_system",
+
+    # Load libwayland-client at runtime instead of link time.
+    # Combine with client_system to avoid a hard link-time dependency.
+    "dlopen",
+
+    # Unlock Backend::set_max_buffer_size() — requires libwayland-client 1.23+.
+    "libwayland_client_1_23",
+]
+```
+
+```toml Server features
+[dependencies.wayland-backend]
+version = "0.3"
+features = [
+    # Link against libwayland-server (enables sys::server).
+    "server_system",
+
+    # Load libwayland-server at runtime.
+    "dlopen",
+
+    # Unlock Handle::global_name() — requires libwayland-server 1.22+.
+    "libwayland_server_1_22",
+
+    # Unlock Handle::set_default_max_buffer_size() — requires 1.23+.
+    # Implies libwayland_server_1_22.
+    "libwayland_server_1_23",
+]
+```
+</CodeGroup>
+
+<Note>
+The `dlopen` feature is implemented by `wayland-sys`. When enabled, `wayland-sys` uses `once_cell` to load the library lazily the first time it is needed, and all feature-gated symbols resolve to function-pointer calls at runtime instead of link-time symbols. If the library cannot be found, `Backend::connect()` returns a `NoWaylandLib` error.
+</Note>
+
+## Core client types
+
+The client-side backend API revolves around four types. All four are re-exported from whatever backend is active.
+
+```rust
+use wayland_backend::client::{Backend, ObjectId, WeakBackend, ReadEventsGuard};
+use wayland_backend::client::{ObjectData, InvalidId, WaylandError};
+```
+
+| Type | Description |
+|---|---|
+| `Backend` | The client connection. Clone it freely — all clones share the same underlying socket. |
+| `WeakBackend` | A non-owning reference to a `Backend`. Upgrade with `.upgrade()`. |
+| `ObjectId` | A stable handle to a Wayland protocol object. Implements `Clone`, `Eq`, and `Hash`. |
+| `ReadEventsGuard` | Synchronises multi-threaded socket reads. Created by `Backend::prepare_read()`. |
+
+### Connecting and reading events
+
+```rust
+use std::os::unix::net::UnixStream;
+use wayland_backend::client::{Backend, ObjectData};
+
+// Connect to the compositor's socket.
+let stream = UnixStream::connect("/run/user/1000/wayland-0").unwrap();
+let backend = Backend::connect(stream).expect("No libwayland found");
+
+// Flush outgoing requests.
+backend.flush().unwrap();
+
+// Synchronised read — works correctly with multiple threads.
+if let Some(guard) = backend.prepare_read() {
+    guard.read().unwrap();
+}
+```
+
+### `ObjectData` trait
+
+Every Wayland object created through the backend must be associated with an `Arc<dyn ObjectData>`. The trait has two required methods:
+
+```rust
+use std::sync::Arc;
+use wayland_backend::client::{Backend, ObjectData, ObjectId};
+use wayland_backend::protocol::Message;
+use std::os::unix::io::OwnedFd;
+
+struct MyData;
+
+impl ObjectData for MyData {
+    fn event(
+        self: Arc<Self>,
+        backend: &Backend,
+        msg: Message<ObjectId, OwnedFd>,
+    ) -> Option<Arc<dyn ObjectData>> {
+        println!("Received event opcode {}", msg.opcode);
+        // Return Some(data) if the event creates a new object; None otherwise.
+        None
+    }
+
+    fn destroyed(&self, id: ObjectId) {
+        println!("Object {id} was destroyed");
+    }
+}
+```
+
+## Core server types
+
+```rust
+use wayland_backend::server::{Backend, Handle, ObjectId, ClientId, GlobalId};
+use wayland_backend::server::{ObjectData, GlobalHandler, ClientData};
+```
+
+| Type | Description |
+|---|---|
+| `Backend<D>` | The server. Parameterised by your application state type `D`. |
+| `Handle` | Cloneable view into the server for creating globals, sending events, and managing objects. |
+| `ObjectId` | Identifies a specific object owned by a specific client. |
+| `ClientId` | Identifies a connected client. |
+| `GlobalId` | Identifies an advertised global. |
+
+### Server dispatch loop
+
+```rust
+use wayland_backend::server::Backend;
+
+struct AppState { /* your fields */ }
+
+let mut server = Backend::<AppState>::new().unwrap();
+let handle = server.handle();
+
+// Accept a client connection.
+// let stream = listener.accept()?;
+// handle.insert_client(stream, Arc::new(()))?;
+
+let mut state = AppState { /* ... */ };
+loop {
+    // Poll server.poll_fd() for readability, then:
+    server.dispatch_all_clients(&mut state).unwrap();
+}
+```
+
+## The `dlopen` feature explained
+
+Without `dlopen`, the build script links your binary directly against `libwayland-client.so` or `libwayland-server.so`. Starting your application on a system that lacks those libraries produces an `ELF` loader error before `main()` even runs.
+
+With `dlopen`, the library is opened at runtime via `dlopen(3)`. Your binary starts successfully even on a system without Wayland. Wayland functionality is gated behind the `is_lib_available()` check from `wayland-sys`, and a missing library surfaces as a `NoWaylandLib` error when you first call `Backend::connect()`.
+
+```toml
+# Enable runtime loading for X11/Wayland hybrid applications.
+[dependencies.wayland-backend]
+version = "0.3"
+features = ["client_system", "dlopen"]
+```
+
+```rust
+use wayland_backend::client::{Backend, NoWaylandLib};
+use std::os::unix::net::UnixStream;
+
+fn try_connect(stream: UnixStream) -> Result<Backend, NoWaylandLib> {
+    Backend::connect(stream)
+    // Returns Err(NoWaylandLib) if libwayland-client.so could not be loaded.
+}
+```
+
+<Tip>
+The `dlopen` feature is particularly useful for applications that support both X11 and Wayland. You can attempt a Wayland connection at startup and fall back to X11 without requiring `libwayland` to be present on X11-only systems.
+</Tip>
+
+## Version-gated features
+
+Some libwayland APIs were added in specific library versions. `wayland-backend` gates them behind Cargo features so that your binary can still run on older systems when those features are disabled.
+
+| Feature | Minimum library version | Unlocks |
+|---|---|---|
+| `libwayland_client_1_23` | libwayland-client 1.23 | `Backend::set_max_buffer_size()` |
+| `libwayland_server_1_22` | libwayland-server 1.22 | `Handle::global_name()` |
+| `libwayland_server_1_23` | libwayland-server 1.23 | `Handle::set_default_max_buffer_size()`, `Handle::set_client_max_buffer_size()` |
+
+`libwayland_server_1_23` implies `libwayland_server_1_22`.
+
+## `raw-window-handle` integration
+
+Enable the `rwh_06` feature on `wayland-backend` together with `client_system` to get a [`HasDisplayHandle`] implementation on `client::Backend`:
+
+```toml
+[dependencies.wayland-backend]
+version = "0.3"
+features = ["client_system", "rwh_06"]
+```
+
+```rust
+use raw_window_handle::HasDisplayHandle;
+use wayland_backend::client::Backend;
+
+fn get_display_handle(backend: &Backend) {
+    let handle = backend.display_handle().unwrap();
+    // Pass `handle` to wgpu, winit, or other rwh_06-aware libraries.
+}
+```

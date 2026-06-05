@@ -1,0 +1,172 @@
+---
+title: "wayland-scanner proc-macro reference"
+sidebarTitle: "wayland-scanner"
+description: "Reference for wayland-scanner 0.31: generate_interfaces!, generate_client_code!, and generate_server_code! proc-macros for generating Rust from Wayland XML."
+---
+
+`wayland-scanner` is a procedural macro crate that reads Wayland XML protocol specification files and generates the corresponding Rust types, trait implementations, and interface metadata. It is the standard code-generation tool for custom Wayland protocol extensions in the wayland-rs ecosystem, producing code that integrates directly with `wayland-client`, `wayland-server`, and `wayland-backend`.
+
+<Note>
+Version covered by this reference: **0.31.10**. Full API documentation is available at [docs.rs/wayland-scanner](https://docs.rs/wayland-scanner/).
+</Note>
+
+<Note>
+Before writing a custom protocol integration, check whether [wayland-protocols](https://docs.rs/wayland-protocols) already exposes the extension you need. It covers many standard protocol extensions such as `xdg-shell`, `wlr-layer-shell`, and more.
+</Note>
+
+## Installation
+
+`wayland-scanner` is a **proc-macro crate** and must be added as a **regular dependency** (not a `[build-dependencies]` entry). The proc-macros expand at compile time when invoked inside your source files.
+
+```toml
+[dependencies]
+wayland-scanner = "0.31.10"
+# Also bring in wayland-client or wayland-server depending on your use case
+wayland-client = "0.31"
+```
+
+<Warning>
+Do **not** add `wayland-scanner` under `[build-dependencies]`. The three macros are procedural macros invoked in Rust source files, not in `build.rs`.
+</Warning>
+
+## The three proc-macros
+
+### `generate_interfaces!(path)`
+
+Generates the low-level C-compatible interface structs (`wl_interface`, `wl_message`) for all protocol objects defined in the XML file. These structs are required by the `*_system` backends in `wayland-backend` for FFI interoperability with `libwayland`.
+
+```rust
+wayland_scanner::generate_interfaces!("./path/to/the/protocol.xml");
+```
+
+| Parameter | Type | Description |
+|---|---|---|
+| `path` | string literal | Path to the Wayland XML file, relative to `CARGO_MANIFEST_DIR`. |
+
+**Output:** A set of `static` items named after each interface in the XML (e.g. `WL_MY_OBJECT_INTERFACE`). This macro is intended to be called inside a module named `__interfaces` (see the module pattern below).
+
+### `generate_client_code!(path)`
+
+Generates the complete client-side Rust API for all protocol objects in the XML file. This includes proxy types, request methods, event enums, and all trait implementations required by `wayland-client`.
+
+```rust
+wayland_scanner::generate_client_code!("./path/to/the/protocol.xml");
+```
+
+| Parameter | Type | Description |
+|---|---|---|
+| `path` | string literal | Path to the Wayland XML file, relative to `CARGO_MANIFEST_DIR`. |
+
+**Output:** One Rust module per interface defined in the XML, each containing the proxy type, its request methods, and an `Event` enum describing the events it can receive.
+
+### `generate_server_code!(path)`
+
+Generates the complete server-side Rust API for all protocol objects in the XML file. This includes resource types, event-sending methods, and request enums, for use with `wayland-server`.
+
+```rust
+wayland_scanner::generate_server_code!("./path/to/the/protocol.xml");
+```
+
+| Parameter | Type | Description |
+|---|---|---|
+| `path` | string literal | Path to the Wayland XML file, relative to `CARGO_MANIFEST_DIR`. |
+
+**Output:** One Rust module per interface, each containing the resource type and a `Request` enum describing the requests the server can receive from clients.
+
+## The `__interfaces` module pattern
+
+The `generate_interfaces!` macro must be called in a submodule named `__interfaces`. The generated client or server code refers to this module by that exact name to access the low-level interface structs.
+
+```rust
+pub mod __interfaces {
+    // Import core protocol interfaces if your protocol references them
+    use wayland_client::protocol::__interfaces::*;
+    wayland_scanner::generate_interfaces!("./path/to/the/protocol.xml");
+}
+use self::__interfaces::*;
+```
+
+This pattern keeps the FFI-level structures isolated from the public API surface of your protocol module.
+
+## Complete client-side module template
+
+The following template is the canonical way to expose a custom Wayland protocol client-side. The path to the XML file is always relative to the crate root (`CARGO_MANIFEST_DIR`).
+
+```rust
+pub mod my_protocol {
+    use wayland_client;
+    // Import objects from the core protocol if needed
+    use wayland_client::protocol::*;
+
+    // This module hosts a low-level representation of the protocol objects.
+    // You will not need to interact with it yourself, but the code generated
+    // by generate_client_code! will use it.
+    pub mod __interfaces {
+        // Import the interfaces from the core protocol if needed
+        use wayland_client::protocol::__interfaces::*;
+        wayland_scanner::generate_interfaces!("./path/to/the/protocol.xml");
+    }
+    use self::__interfaces::*;
+
+    // This macro generates the actual types that represent the Wayland objects
+    // of your custom protocol (proxy types, request methods, event enums).
+    wayland_scanner::generate_client_code!("./path/to/the/protocol.xml");
+}
+```
+
+After the macros expand, each interface `my_object` defined in the XML becomes accessible as `my_protocol::my_object::MyObject` (a proxy type), with request methods on the proxy and an `Event` enum for dispatch.
+
+## Complete server-side module template
+
+The server-side pattern is identical — replace `client` with `server` and `generate_client_code!` with `generate_server_code!`.
+
+```rust
+pub mod my_protocol {
+    use wayland_server;
+    // Import objects from the core protocol if needed
+    use wayland_server::protocol::*;
+
+    pub mod __interfaces {
+        use wayland_server::protocol::__interfaces::*;
+        wayland_scanner::generate_interfaces!("./path/to/the/protocol.xml");
+    }
+    use self::__interfaces::*;
+
+    // Generates resource types, send_* event methods, and Request enums
+    wayland_scanner::generate_server_code!("./path/to/the/protocol.xml");
+}
+```
+
+## Path resolution
+
+All three macros resolve paths relative to the `CARGO_MANIFEST_DIR` environment variable, which Cargo sets to the directory containing the `Cargo.toml` of the crate being compiled. This means a path like `"./protocols/my-extension.xml"` resolves to `<crate-root>/protocols/my-extension.xml`.
+
+```
+my-crate/
+├── Cargo.toml
+├── src/
+│   └── lib.rs          ← macros invoked here
+└── protocols/
+    └── my-extension.xml ← referenced as "./protocols/my-extension.xml"
+```
+
+<Tip>
+If `CARGO_MANIFEST_DIR` is not set (unusual outside of Cargo builds), the path is used as-is relative to the current working directory.
+</Tip>
+
+## Protocol XML format
+
+The Wayland protocol XML format is defined by the Wayland project. Each file contains a `<protocol>` root element with one or more `<interface>` elements, each describing requests (client → server) and events (server → client).
+
+Key XML elements:
+
+| Element | Description |
+|---|---|
+| `<protocol name="...">` | Root element; the protocol name. |
+| `<interface name="..." version="...">` | Defines one Wayland object type. |
+| `<request name="...">` | A method the client may invoke on the object. |
+| `<event name="...">` | A notification the server sends to the client. |
+| `<arg name="..." type="...">` | An argument; types include `int`, `uint`, `fixed`, `string`, `object`, `new_id`, `array`, `fd`. |
+| `<enum name="...">` | A named set of `uint` constants. |
+
+The authoritative format specification lives in the [Wayland protocol repository](https://gitlab.freedesktop.org/wayland/wayland/-/blob/main/protocol/wayland.xml), which is itself a useful example of the XML structure.

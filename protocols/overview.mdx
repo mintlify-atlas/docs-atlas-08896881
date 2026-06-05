@@ -1,0 +1,136 @@
+---
+title: "Wayland protocol extensions in wayland-rs"
+sidebarTitle: "Overview"
+description: "wayland-rs ships pre-generated Rust bindings for stable, staging, unstable, wlroots, KDE Plasma, and experimental protocol extensions."
+---
+
+The core Wayland protocol defines a handful of primitives — surfaces, outputs, seats, and buffers — but nearly everything that a real desktop application or compositor needs lives in *protocol extensions*. These are additional XML specifications that define supplementary globals and interfaces: window management, screen capture, fractional scaling, color management, clipboard control, and much more.
+
+wayland-rs ships a family of crates that provide pre-generated, type-safe Rust bindings for these extensions. Rather than running `wayland-scanner` yourself, you add the appropriate crate as a dependency, opt into the features you need, and the client-side or server-side types are ready to use. Every protocol module exposes a `client` sub-module (gated by the `client` feature) and a `server` sub-module (gated by the `server` feature), matching the same pattern used in `wayland-client` and `wayland-server`.
+
+## Protocol crates
+
+<CardGroup cols={2}>
+  <Card title="wayland-protocols" href="/protocols/xdg">
+    The official extensions from the [wayland-protocols](https://gitlab.freedesktop.org/wayland/wayland-protocols) repository. Contains stable, staging, and unstable tiers covering XDG shell, viewporter, presentation-time, Linux DMA-BUF, fractional scale, and more.
+  </Card>
+  <Card title="wayland-protocols-wlr" href="/protocols/wlr">
+    Bindings for the [wlr-protocols](https://gitlab.freedesktop.org/wlroots/wlr-protocols) repository maintained by the wlroots project. Includes layer-shell, screencopy, output management, and gamma control.
+  </Card>
+  <Card title="wayland-protocols-plasma" href="/protocols/plasma">
+    Bindings for [plasma-wayland-protocols](https://github.com/KDE/plasma-wayland-protocols), the KDE project's collection of Plasma-specific extensions such as blur, shadow, DPMS, and screencast.
+  </Card>
+  <Card title="wayland-protocols-misc">
+    Orphaned or de-facto protocols with no official home — GTK primary selection, virtual keyboard, and input method v2 — that are still widely used in the ecosystem.
+  </Card>
+  <Card title="wayland-protocols-experimental">
+    Protocols under official evaluation that are not yet recommended for production use: experimental session management, input method, and text input extensions.
+  </Card>
+  <Card title="Custom protocols" href="/protocols/custom">
+    Use `wayland-scanner` proc-macros to generate bindings from any Wayland XML specification file.
+  </Card>
+</CardGroup>
+
+## Adding a protocol crate to your project
+
+Each crate follows the same convention. Add it to `Cargo.toml` and select at least one of the `client` or `server` features. You typically want `wayland-client` or `wayland-server` as a direct dependency too, because the generated types reference their traits.
+
+<CodeGroup>
+```toml wayland-protocols (official)
+[dependencies]
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client"] }
+```
+
+```toml wayland-protocols (server-side)
+[dependencies]
+wayland-server = "0.31"
+wayland-protocols = { version = "0.32", features = ["server"] }
+```
+
+```toml wayland-protocols-wlr
+[dependencies]
+wayland-client = "0.31"
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+```
+
+```toml wayland-protocols-plasma
+[dependencies]
+wayland-client = "0.31"
+wayland-protocols-plasma = { version = "0.3", features = ["client"] }
+```
+
+```toml wayland-protocols-misc
+[dependencies]
+wayland-client = "0.31"
+wayland-protocols-misc = { version = "0.3", features = ["client"] }
+```
+
+```toml wayland-protocols-experimental
+[dependencies]
+wayland-client = "0.31"
+wayland-protocols-experimental = { version = "20251230.0.3", features = ["client"] }
+```
+</CodeGroup>
+
+## Protocol stability tiers
+
+The `wayland-protocols` crate organises its contents into three tiers that reflect how mature a protocol specification is. Understanding the differences matters when deciding which protocols to rely on in production code.
+
+<Tabs>
+  <Tab title="Stable">
+    Stable protocols have gone through the full wayland-protocols review process and are considered production-ready. Their interfaces will not change in a backward-incompatible way. Examples include `xdg-shell`, `linux-dmabuf`, `viewporter`, `presentation-time`, and `tablet-v2`. These are available unconditionally — no Cargo feature flag is required.
+
+    ```toml
+    # Stable protocols need no extra features
+    wayland-protocols = { version = "0.32", features = ["client"] }
+    ```
+  </Tab>
+  <Tab title="Staging">
+    Staging protocols are ready for wider adoption and compositors are encouraged to implement them, but they may still be replaced by a new major version or a completely different protocol in the future. Enable the `staging` feature to access them.
+
+    ```toml
+    wayland-protocols = { version = "0.32", features = ["client", "staging"] }
+    ```
+
+    Staging examples: `xdg-activation-v1`, `fractional-scale-v1`, `color-management-v1`, `linux-drm-syncobj-v1`, `ext-idle-notify-v1`, `ext-session-lock-v1`.
+  </Tab>
+  <Tab title="Unstable">
+    Unstable protocols are the old category from before the staging concept was introduced. They are recognised by the `z` prefix on their interface names (e.g. `zwp_`, `zxdg_`). This category is now deprecated — no new protocols are added here — but many are still in active use. Enable the `unstable` feature to access them.
+
+    ```toml
+    wayland-protocols = { version = "0.32", features = ["client", "unstable"] }
+    ```
+
+    Unstable examples: `xdg-decoration-unstable-v1`, `xdg-output-unstable-v1`, `pointer-constraints-unstable-v1`, `relative-pointer-unstable-v1`, `input-method-unstable-v1`.
+  </Tab>
+</Tabs>
+
+<Note>
+You can combine feature flags freely. A compositor that needs staging session-lock and legacy unstable pointer-constraints can use `features = ["server", "staging", "unstable"]` in a single dependency declaration.
+</Note>
+
+## Module layout inside each crate
+
+Within `wayland-protocols`, protocols are grouped into four top-level modules:
+
+| Module | Purpose |
+|--------|---------|
+| `wayland_protocols::xdg` | Window management protocols (XDG Shell, XDG Output, XDG Decoration, etc.) |
+| `wayland_protocols::wp` | General-purpose protocols (presentation-time, viewporter, linux-dmabuf, tablet, etc.) |
+| `wayland_protocols::ext` | Miscellaneous protocols that don't fit the other categories (idle-notify, session-lock, etc.) |
+| `wayland_protocols::xwayland` | Protocols specifically for the XWayland compatibility layer |
+
+Each protocol module exposes `client` and `server` sub-modules that are conditionally compiled based on the active Cargo features:
+
+```rust
+// Client-side XDG shell types
+use wayland_protocols::xdg::shell::client::{xdg_wm_base, xdg_surface, xdg_toplevel};
+
+// Server-side XDG shell types (requires the "server" feature)
+use wayland_protocols::xdg::shell::server::{xdg_wm_base, xdg_surface, xdg_toplevel};
+```
+
+<Tip>
+When both `client` and `server` features are enabled — common in compositor codebases — the `client` and `server` sub-modules coexist under the same protocol path. Use explicit module paths to avoid ambiguity.
+</Tip>

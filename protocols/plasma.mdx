@@ -1,0 +1,315 @@
+---
+title: "KDE Plasma protocol extensions with wayland-protocols-plasma"
+sidebarTitle: "Plasma Protocols"
+description: "wayland-protocols-plasma exposes KDE Plasma Wayland protocol extensions from the plasma-wayland-protocols repository in idiomatic Rust."
+---
+
+The `wayland-protocols-plasma` crate provides pre-generated Rust bindings for the [plasma-wayland-protocols](https://github.com/KDE/plasma-wayland-protocols) repository — the KDE project's collection of Wayland protocol extensions that support features specific to the KDE Plasma desktop environment. These protocols cover capabilities such as visual surface effects (blur, shadow, contrast), output device management, virtual desktops, screen casting, and server-side decoration.
+
+These protocols are primarily useful when writing clients or compositor components that target KWin (the KDE compositor) or other Plasma-aware compositors. They are not implemented by generic wlroots-based compositors. If you are writing an application that must work on both Plasma and other compositors, check for each global in the registry at runtime and degrade gracefully when it is absent.
+
+## Cargo setup
+
+Add `wayland-protocols-plasma` to your `Cargo.toml` with the `client` feature, the `server` feature, or both. No additional feature flags are needed — all plasma protocols are unconditionally available once the crate is included.
+
+<CodeGroup>
+```toml Client-side
+[dependencies]
+wayland-client = "0.31"
+wayland-protocols-plasma = { version = "0.3", features = ["client"] }
+```
+
+```toml Server-side (KWin plugin or compositor)
+[dependencies]
+wayland-server = "0.31"
+wayland-protocols-plasma = { version = "0.3", features = ["server"] }
+```
+
+```toml Both sides
+[dependencies]
+wayland-client = "0.31"
+wayland-server = "0.31"
+wayland-protocols-plasma = { version = "0.3", features = ["client", "server"] }
+```
+</CodeGroup>
+
+## Available protocols
+
+All modules are available at the crate root. Each exposes a `client` sub-module and a `server` sub-module controlled by the respective Cargo features.
+
+### Visual effects
+
+These protocols allow clients to request that the compositor apply visual post-processing effects to regions of their surfaces. KWin applies these as GPU compositing passes.
+
+<Tabs>
+  <Tab title="Blur">
+    `org_kde_kwin_blur_manager` lets a client mark a region of its surface for background blur. Commonly used for translucent terminal windows, panels, and sidebars.
+
+    ```rust
+    use wayland_protocols_plasma::blur::client::{
+        org_kde_kwin_blur_manager,
+        org_kde_kwin_blur,
+    };
+    ```
+  </Tab>
+  <Tab title="Contrast">
+    `org_kde_kwin_contrast_manager` adjusts the contrast and intensity of the area behind a surface, improving readability of text over busy backgrounds.
+
+    ```rust
+    use wayland_protocols_plasma::contrast::client::{
+        org_kde_kwin_contrast_manager,
+        org_kde_kwin_contrast,
+    };
+    ```
+  </Tab>
+  <Tab title="Shadow">
+    `org_kde_kwin_shadow_manager` attaches a drop shadow to a surface using up to eight directional buffer tiles.
+
+    ```rust
+    use wayland_protocols_plasma::shadow::client::{
+        org_kde_kwin_shadow_manager,
+        org_kde_kwin_shadow,
+    };
+    ```
+  </Tab>
+  <Tab title="Slide">
+    `org_kde_kwin_slide_manager` attaches slide-in/slide-out animation metadata to a surface, used by Plasma's window manager for panel show/hide transitions.
+
+    ```rust
+    use wayland_protocols_plasma::slide::client::{
+        org_kde_kwin_slide_manager,
+        org_kde_kwin_slide,
+    };
+    ```
+  </Tab>
+</Tabs>
+
+### Output management
+
+Plasma provides its own output device description and configuration protocols, separate from the wlr-protocols equivalents.
+
+#### Output Device — `output_device`
+
+The output device protocols describe the physical properties and capabilities of connected displays. Version 2 (`kde-output-device-v2`) is the current version.
+
+```rust
+// Version 1 (legacy)
+use wayland_protocols_plasma::output_device::v1::client::org_kde_kwin_outputdevice;
+
+// Version 2 (current)
+use wayland_protocols_plasma::output_device::v2::client::kde_output_device_v2;
+```
+
+#### Output Management — `output_management`
+
+Allows clients to read and apply display configuration changes (resolution, position, scale, color profile) atomically. Version 2 depends on `output_device::v2`.
+
+```rust
+// Version 2 (current)
+use wayland_protocols_plasma::output_management::v2::client::{
+    kde_output_management_v2,
+    kde_output_configuration_v2,
+};
+```
+
+#### Output Order — `output_order::v1`
+
+Reports the preferred order of outputs to clients, so that primary-output-aware software (e.g. taskbars) can identify the main screen.
+
+```rust
+use wayland_protocols_plasma::output_order::v1::client::kde_output_order_v1;
+```
+
+#### Primary Output — `primary_output::v1`
+
+Identifies a single output as the "primary" display — the one where new windows should appear by default.
+
+```rust
+use wayland_protocols_plasma::primary_output::v1::client::kde_primary_output_v1;
+```
+
+### Window and desktop management
+
+#### Plasma Shell — `plasma_shell`
+
+`org_kde_plasma_surface` attaches Plasma-specific roles and properties to a `wl_surface`: panel type, panel visibility behavior (auto-hide, dodging), position locking, and role-based z-ordering. This is how Plasma panels and desktop widgets are created.
+
+```rust
+use wayland_protocols_plasma::plasma_shell::client::{
+    org_kde_plasma_shell,
+    org_kde_plasma_surface,
+};
+```
+
+#### Plasma Window Management — `plasma_window_management`
+
+`org_kde_plasma_window_management` provides a rich interface for enumerating and controlling open application windows, including their icon, title, virtual desktop membership, minimised/maximised/active state, and more. Used by Plasma's taskbar and window switcher.
+
+```rust
+use wayland_protocols_plasma::plasma_window_management::client::{
+    org_kde_plasma_window_management,
+    org_kde_plasma_window,
+};
+```
+
+#### Plasma Virtual Desktop — `plasma_virtual_desktop`
+
+Enumerates and controls virtual desktops (workspaces), allowing clients to move windows between them and to listen for desktop changes.
+
+```rust
+use wayland_protocols_plasma::plasma_virtual_desktop::client::{
+    org_kde_plasma_virtual_desktop_management,
+    org_kde_plasma_virtual_desktop,
+};
+```
+
+### Input and interaction
+
+#### Fake Input — `fake_input`
+
+`org_kde_kwin_fake_input` allows a privileged client to inject synthetic pointer and keyboard events into the compositor input stream. Used by automation and accessibility tools.
+
+```rust
+use wayland_protocols_plasma::fake_input::client::org_kde_kwin_fake_input;
+```
+
+#### Keystate — `keystate`
+
+Provides the current state of modifier keys (Caps Lock, Num Lock, Scroll Lock) as compositor-level events.
+
+```rust
+use wayland_protocols_plasma::keystate::client::org_kde_kwin_keystate;
+```
+
+### Screen and power management
+
+#### DPMS — `dpms`
+
+`org_kde_kwin_dpms_manager` reads and sets the DPMS (Display Power Management Signaling) power state of individual outputs. Provides the same capability as `zwlr_output_power_manager_v1` in a Plasma-specific form.
+
+```rust
+use wayland_protocols_plasma::dpms::client::{
+    org_kde_kwin_dpms_manager,
+    org_kde_kwin_dpms,
+};
+```
+
+#### Screencast — `screencast::v1`
+
+`zkde_screencast_unstable_v1` enables screen recording and casting using PipeWire as the transport. This is the protocol behind the KDE/XDG portal screen sharing implementation.
+
+```rust
+use wayland_protocols_plasma::screencast::v1::client::zkde_screencast_unstable_v1;
+```
+
+#### Screen Edge — `screen_edge::v1`
+
+Allows clients to register callbacks for screen-edge triggers — activating a client action when the pointer reaches the edge of the screen.
+
+```rust
+use wayland_protocols_plasma::screen_edge::v1::client::kde_screen_edge_manager_v1;
+```
+
+#### Lockscreen Overlay — `lockscreen_overlay::v1`
+
+Grants a surface the ability to be displayed on top of the lock screen surface, used by notification overlays and media controls that should remain visible when the screen is locked.
+
+```rust
+use wayland_protocols_plasma::lockscreen_overlay::v1::client::kde_lockscreen_overlay_v1;
+```
+
+#### External Brightness — `external_brightness::v1`
+
+Allows external displays to report their current brightness to the compositor, enabling Plasma's power management to account for them.
+
+```rust
+use wayland_protocols_plasma::external_brightness::v1::client::kde_external_brightness_v1;
+```
+
+### Decorations and appearance
+
+#### Server Decoration — `server_decoration`
+
+`org_kde_kwin_server_decoration_manager` negotiates whether window decorations should be rendered server-side by KWin. This is an older protocol predating `xdg-decoration-unstable-v1`.
+
+```rust
+use wayland_protocols_plasma::server_decoration::client::{
+    org_kde_kwin_server_decoration_manager,
+    org_kde_kwin_server_decoration,
+};
+```
+
+#### Server Decoration Palette — `server_decoration_palette`
+
+Lets a client suggest a color palette to the compositor for use in server-side decoration rendering, enabling themed title bars.
+
+```rust
+use wayland_protocols_plasma::server_decoration_palette::client::{
+    org_kde_kwin_server_decoration_palette_manager,
+    org_kde_kwin_server_decoration_palette,
+};
+```
+
+#### Application Menu — `appmenu`
+
+`org_kde_kwin_appmenu_manager` allows a client to advertise a D-Bus service path and object path that exposes its menu model, enabling global menu bars in Plasma.
+
+```rust
+use wayland_protocols_plasma::appmenu::client::{
+    org_kde_kwin_appmenu_manager,
+    org_kde_kwin_appmenu,
+};
+```
+
+### Text input
+
+Plasma ships its own text input protocol variants for input method support:
+
+```rust
+// Version 1
+use wayland_protocols_plasma::text_input::v1::client::org_kde_kwin_text_input_manager;
+
+// Version 2 (unstable)
+use wayland_protocols_plasma::text_input::v2::client::zwp_text_input_manager_v2;
+```
+
+---
+
+## Checking for protocol availability
+
+Because plasma protocols are only available on compositors that implement them, always check the registry at runtime before using any plasma global:
+
+```rust
+impl Dispatch<wl_registry::WlRegistry, ()> for State {
+    fn event(
+        &self,
+        state: &mut State,
+        registry: &wl_registry::WlRegistry,
+        event: wl_registry::Event,
+        _: &(),
+        qh: &QueueHandle<State>,
+    ) {
+        if let wl_registry::Event::Global { name, interface, version } = event {
+            match interface.as_str() {
+                "org_kde_plasma_shell" => {
+                    // Only present on KWin-based compositors
+                    state.plasma_shell = Some(
+                        registry.bind::<org_kde_plasma_shell::OrgKdePlasmaShell, _, _>(
+                            name, version.min(8), qh, ()
+                        )
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
+}
+```
+
+<Tip>
+Use `version.min(N)` when binding a global to request only the interface version your code was written against. This prevents errors if the compositor advertises a higher version than your bindings support.
+</Tip>
+
+<Note>
+plasma-wayland-protocols are developed by KDE and are intended for use with KWin. While some protocols (like `server_decoration`) have been adopted informally by other compositors, most are KDE-specific. Always design your application to work without them by checking for global presence and falling back gracefully.
+</Note>

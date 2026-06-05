@@ -1,0 +1,261 @@
+---
+title: "FFI and interoperability with C Wayland libraries"
+sidebarTitle: "FFI & Interop"
+description: "Use wayland-sys and the system backend to interoperate with C Wayland code. Access raw wl_display, wl_proxy, and wl_resource pointers safely."
+---
+
+Most Wayland applications written in Rust can stay entirely within the safe abstractions provided by `wayland-client` and `wayland-server`. There are situations, however, where you must cross the Rust/C boundary: initialising EGL or Vulkan (both of which need a raw `wl_display*`), embedding wayland-rs inside an existing C compositor that already owns the display, or calling into a third-party Wayland protocol extension library. The `wayland-sys` crate supplies the raw FFI declarations, while `wayland-backend` with the `client_system` or `server_system` feature exposes safe methods for obtaining those raw pointers from managed Rust objects.
+
+<Note>
+In most cases you should use the higher-level methods on `wayland_backend::sys::client::Backend` and `wayland_backend::sys::server::Handle` rather than calling `wayland-sys` functions directly. `wayland-sys` is a low-level building block intended for crate authors.
+</Note>
+
+## `wayland-sys` — raw FFI declarations
+
+`wayland-sys` binds the four standard Wayland C libraries. Each is gated behind a Cargo feature of the same name:
+
+| Feature | Library | Module |
+|---|---|---|
+| `client` | `libwayland-client.so` | `wayland_sys::client` |
+| `server` | `libwayland-server.so` | `wayland_sys::server` |
+| `cursor` | `libwayland-cursor.so` | `wayland_sys::cursor` |
+| `egl` | `libwayland-egl.so` | `wayland_sys::egl` |
+
+The `dlopen` feature changes all four from link-time symbols to runtime handles loaded via `dlopen(3)`.
+
+```toml
+[dependencies.wayland-sys]
+version = "0.31"
+features = [
+    "client",   # libwayland-client.so
+    "server",   # libwayland-server.so (compositor use)
+    "egl",      # libwayland-egl.so (requires client)
+    "cursor",   # libwayland-cursor.so (requires client)
+    "dlopen",   # load all of the above at runtime
+]
+```
+
+### pkg-config
+
+`wayland-sys` uses `pkg-config` in its build script to locate the system libraries. It probes only the features you have enabled:
+
+```bash
+# Install development headers on Debian / Ubuntu
+apt-get install libwayland-dev libwayland-egl1
+
+# Verify pkg-config can find them
+pkg-config --modversion wayland-client   # e.g. 1.22.0
+pkg-config --modversion wayland-egl
+```
+
+When the `dlopen` feature is active, `wayland-sys` skips the `pkg-config` linker flags entirely — no `rustc-link-lib` directives are emitted — so your binary will not fail to load on a system that lacks the library.
+
+### The `ffi_dispatch!` macro
+
+All calls into `wayland-sys` go through the `ffi_dispatch!` macro. When `dlopen` is **off**, it expands to a direct C function call. When `dlopen` is **on**, it calls through a function-pointer stored in the handle returned by `wayland_client_handle()` (or `wayland_server_handle()`, etc.).
+
+```rust
+#[macro_use] extern crate wayland_sys;
+
+use wayland_sys::client::*; // brings wl_display, wl_proxy, and wayland_client_handle() into scope
+
+unsafe fn connect_raw() -> *mut wl_display {
+    // Expands to either `wl_display_connect(std::ptr::null())` (no dlopen)
+    // or  `(wayland_client_handle().wl_display_connect)(std::ptr::null())` (dlopen).
+    ffi_dispatch!(wayland_client_handle(), wl_display_connect, std::ptr::null())
+}
+```
+
+<Warning>
+Every symbol used in `ffi_dispatch!` must be in scope. Glob-import the appropriate module (e.g. `use wayland_sys::client::*`) to guarantee this. Failing to do so produces a compile-time error when `dlopen` is disabled and a linker error when it is enabled.
+</Warning>
+
+## Getting raw pointers from managed Rust objects
+
+The safe path to raw C pointers goes through the system backend (`client_system` / `server_system`). Both backends add extra methods to their types that are only available in the `sys` module.
+
+### Client side — `wl_display*` and `wl_proxy*`
+
+```rust
+use wayland_backend::client::Backend; // resolves to sys::client::Backend with client_system
+
+// -- wl_display* --
+// Returns the raw wl_display pointer for the lifetime of the backend.
+// Pass this to eglGetDisplay() or vkCreateWaylandSurfaceKHR().
+let display: *mut wayland_sys::client::wl_display = backend.display_ptr();
+
+// -- wl_proxy* from an ObjectId --
+// ObjectId::as_ptr() is only available on the sys backend.
+use wayland_backend::client::ObjectId;
+let proxy: std::ptr::NonNull<wayland_sys::client::wl_proxy> = object_id.as_ptr()?;
+```
+
+### Server side — `wl_display*` and `wl_resource*`
+
+```rust
+use wayland_backend::server::Handle; // resolves to sys::server::Handle with server_system
+
+// -- wl_display* --
+// Available on Handle when server_system is enabled.
+let display: *mut wayland_sys::server::wl_display = handle.display_ptr();
+
+// -- wl_resource* from an ObjectId --
+use wayland_backend::server::ObjectId;
+let resource: std::ptr::NonNull<wayland_sys::server::wl_resource> = object_id.as_ptr()?;
+```
+
+### Creating an `ObjectId` from a C pointer
+
+When a C library hands you a `wl_proxy*` or `wl_resource*`, convert it back into a managed `ObjectId` for use with the rest of the Rust API:
+
+```rust
+use wayland_backend::client::ObjectId;
+use wayland_sys::client::wl_proxy;
+
+// Safety: ptr must be a valid wl_proxy for the given interface and must remain
+// valid for at least as long as the returned ObjectId is used.
+let id = unsafe {
+    ObjectId::from_ptr(&MY_INTERFACE, raw_proxy_ptr)
+}?;
+```
+
+Similarly on the server side:
+
+```rust
+use wayland_backend::server::ObjectId;
+use wayland_sys::server::wl_resource;
+
+let id = unsafe {
+    ObjectId::from_ptr(&MY_INTERFACE, raw_resource_ptr)
+}?;
+```
+
+## Interoperating with a foreign `wl_display`
+
+If your Rust code is loaded as a plugin into a C compositor (or any other host that already holds a `wl_display`), use `Backend::from_foreign_display()` to attach wayland-rs without taking ownership of the connection:
+
+```rust
+use wayland_backend::client::Backend;
+use wayland_sys::client::wl_display;
+
+extern "C" fn rust_plugin_init(display: *mut wl_display) {
+    // Safety: display must be a valid wl_display that outlives the Backend.
+    let backend = unsafe { Backend::from_foreign_display(display) };
+
+    // The backend is in "guest" mode: it will not close the connection on drop.
+    // Clean up all Wayland state before dropping the backend to avoid protocol errors.
+}
+```
+
+<Warning>
+When a `Backend` created by `from_foreign_display()` is dropped, the connection remains open. If the server sends an event to an object that was created from this backend after it has been dropped, the event is silently discarded. This can cause protocol errors if the server expects a reply.
+</Warning>
+
+## Common FFI scenarios
+
+<Tabs>
+  <Tab title="EGL surface creation">
+EGL needs both the `wl_display*` and the `wl_egl_window*`. Obtain the first from `Backend::display_ptr()` and the second from `WlEglSurface::ptr()` (see [EGL Integration](/utilities/egl)):
+
+```rust
+use wayland_backend::client::Backend;
+use wayland_egl::WlEglSurface;
+use std::os::raw::c_void;
+
+fn init_egl(backend: &Backend, egl_surface: &WlEglSurface) {
+    let display: *mut c_void = backend.display_ptr().cast();
+    let window:  *const c_void = egl_surface.ptr();
+
+    // egl::get_display(display)
+    // egl::create_window_surface(egl_display, config, window, None)
+    let _ = (display, window);
+}
+```
+  </Tab>
+  <Tab title="Vulkan WSI">
+The Vulkan Wayland WSI extension (`VK_KHR_wayland_surface`) also requires a raw `wl_display*` and `wl_surface*` (as a `wl_proxy*`):
+
+```rust
+use wayland_backend::client::{Backend, ObjectId};
+use wayland_client::protocol::wl_surface::WlSurface;
+use wayland_client::Proxy; // for .id()
+
+fn vk_create_surface(backend: &Backend, surface: &WlSurface) {
+    let display = backend.display_ptr(); // *mut wl_display
+    let proxy   = surface.id().as_ptr().unwrap(); // NonNull<wl_proxy>
+
+    // VkWaylandSurfaceCreateInfoKHR {
+    //     display: display.cast(),
+    //     surface: proxy.as_ptr().cast(),
+    // }
+    let _ = (display, proxy);
+}
+```
+  </Tab>
+  <Tab title="C compositor plugin">
+A Rust shared library loaded into a C compositor receives the `wl_display*` from the host and builds a guest Backend:
+
+```rust
+use std::sync::Arc;
+use wayland_backend::client::{Backend, ObjectData, ObjectId};
+use wayland_backend::protocol::Message;
+use wayland_sys::client::wl_display;
+use std::os::unix::io::OwnedFd;
+
+struct IgnoreData;
+impl ObjectData for IgnoreData {
+    fn event(self: Arc<Self>, _: &Backend, _: Message<ObjectId, OwnedFd>)
+        -> Option<Arc<dyn ObjectData>> { None }
+    fn destroyed(&self, _: ObjectId) {}
+}
+
+#[no_mangle]
+pub extern "C" fn plugin_init(display: *mut wl_display) {
+    let backend = unsafe { Backend::from_foreign_display(display) };
+    // Use backend to send requests and listen for events.
+    // Drop it before the host tears down the display.
+    drop(backend);
+}
+```
+  </Tab>
+</Tabs>
+
+## Managing unmanaged proxies
+
+When a C library creates a `wl_proxy*` without going through the wayland-rs backend (for example by calling `wl_registry_bind` through the C API), you can adopt it with `Backend::manage_object()`. This is an unsafe operation — you take responsibility for ensuring there is no other owner:
+
+```rust
+use std::sync::Arc;
+use wayland_backend::client::{Backend, ObjectData, ObjectId};
+use wayland_sys::client::wl_proxy;
+use crate::interfaces::WL_FOO_INTERFACE;
+
+unsafe fn adopt_proxy(
+    backend: &Backend,
+    raw: *mut wl_proxy,
+    data: Arc<dyn ObjectData>,
+) -> ObjectId {
+    // Safety: raw must be unmanaged (no Rust side), and interface must be correct.
+    unsafe { backend.manage_object(&WL_FOO_INTERFACE, raw, data) }
+}
+```
+
+## Feature dependency diagram
+
+```
+wayland-sys
+  ├── feature: client  ──► links libwayland-client.so  (via pkg-config)
+  ├── feature: server  ──► links libwayland-server.so
+  ├── feature: egl     ──► links libwayland-egl.so     (implies client)
+  ├── feature: cursor  ──► links libwayland-cursor.so   (implies client)
+  └── feature: dlopen  ──► load all of the above via dlopen at runtime
+
+wayland-backend
+  ├── feature: client_system  ──► wayland-sys/client
+  ├── feature: server_system  ──► wayland-sys/server
+  └── feature: dlopen         ──► wayland-sys/dlopen
+```
+
+<Tip>
+If you only need FFI interop on the client side (the most common case), add `wayland-backend` with `client_system` to your `Cargo.toml` and let it manage `wayland-sys` as a transitive dependency. Reach for `wayland-sys` directly only when writing protocol extension crates that must expose raw symbols to consumers.
+</Tip>

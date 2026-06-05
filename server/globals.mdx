@@ -1,0 +1,310 @@
+---
+title: "Advertising Wayland globals from a compositor"
+sidebarTitle: "Globals"
+description: "Wayland globals expose compositor capabilities to clients. Learn to create, restrict, and remove globals using GlobalDispatch in wayland-server."
+---
+
+In the Wayland protocol, a *global* is the server's mechanism for advertising a capability or extension to clients. When a client connects and requests the registry, the compositor sends it a `wl_registry.global` event for each advertised global. The client can then bind any global it recognises, which creates a typed resource object on both ends of the connection. In `wayland-server` this lifecycle is managed through the `GlobalDispatch` trait and the `DisplayHandle` global management methods.
+
+## The GlobalDispatch trait
+
+```rust
+pub trait GlobalDispatch<I: Resource, State> {
+    fn bind(
+        &self,
+        state:     &mut State,
+        handle:    &DisplayHandle,
+        client:    &Client,
+        resource:  New<I>,
+        data_init: &mut DataInit<'_, State>,
+    );
+
+    fn can_view(&self, _client: &Client) -> bool {
+        true
+    }
+}
+```
+
+`GlobalDispatch` has two methods:
+
+- **`bind()`** — called every time a client binds the global. You receive a `New<I>`, a wrapper around the freshly created resource that has not yet been assigned user-data. You *must* call `data_init.init()` (or `data_init.custom_init()`) before returning; failing to do so panics.
+- **`can_view()`** — a filter called before the global is advertised to each client. Return `false` to hide the global from a specific client. The default implementation returns `true` for all clients.
+
+`GlobalDispatch` is implemented on the *user-data* value you pass to `create_global()`, not on your `State` directly. This design lets a single `State` host many globals, each with its own isolated configuration.
+
+## Creating a global
+
+Call `DisplayHandle::create_global()` after constructing your `Display`. The returned `GlobalId` is an opaque handle you should store if you need to disable or remove the global later.
+
+```rust
+use wayland_server::{DisplayHandle, backend::GlobalId};
+use wayland_server::protocol::wl_compositor::WlCompositor;
+
+// Advertise wl_compositor at version 4.
+// The third argument (here `()`) is the user-data value that implements GlobalDispatch.
+let compositor_global: GlobalId =
+    dh.create_global::<AppState, WlCompositor, _>(4, ());
+```
+
+The `version` argument caps the maximum interface version the compositor promises to support. Clients negotiate a version at or below this cap when they bind.
+
+## Implementing bind()
+
+When a client sends `wl_registry.bind`, `wayland-server` calls `GlobalDispatch::bind()` on the user-data that was provided to `create_global()`. The `New<I>` argument represents the uninitialized resource. You must pass it to `DataInit::init()` together with the per-object user-data that will be used by the resource's `Dispatch` implementation.
+
+```rust
+use wayland_server::{
+    Client, DataInit, DisplayHandle, GlobalDispatch, New,
+    protocol::wl_compositor::WlCompositor,
+};
+
+struct CompositorGlobalData {
+    max_surfaces: usize,
+}
+
+impl GlobalDispatch<WlCompositor, AppState> for CompositorGlobalData {
+    fn bind(
+        &self,
+        state:     &mut AppState,
+        _handle:   &DisplayHandle,
+        client:    &Client,
+        resource:  New<WlCompositor>,
+        data_init: &mut DataInit<'_, AppState>,
+    ) {
+        println!(
+            "Client {:?} bound wl_compositor (max surfaces: {})",
+            client.id(),
+            self.max_surfaces,
+        );
+        // Initialize with per-resource user data.
+        // The type passed here must implement Dispatch<WlCompositor, AppState>.
+        data_init.init(resource, CompositorResourceData { surfaces: Vec::new() });
+    }
+}
+```
+
+<Warning>
+Every code path inside `bind()` must call `data_init.init()` (or `data_init.post_error()` to refuse the bind). A `bind()` that returns without initializing the resource causes a **panic**. If you need to reject a client, post a protocol error instead of silently returning.
+</Warning>
+
+### Posting an error during bind
+
+If you need to refuse a client's bind for policy reasons, use `DataInit::post_error()`:
+
+```rust
+impl GlobalDispatch<WlCompositor, AppState> for CompositorGlobalData {
+    fn bind(
+        &self,
+        state:     &mut AppState,
+        _handle:   &DisplayHandle,
+        client:    &Client,
+        resource:  New<WlCompositor>,
+        data_init: &mut DataInit<'_, AppState>,
+    ) {
+        if state.compositor_already_bound {
+            data_init.post_error(
+                resource,
+                // Use an appropriate protocol error code for your interface
+                0u32,
+                "compositor already bound by this client",
+            );
+        } else {
+            state.compositor_already_bound = true;
+            data_init.init(resource, ());
+        }
+    }
+}
+```
+
+## Access control with can_view()
+
+`can_view()` lets you implement per-client global visibility. It is called before the global is advertised in `wl_registry` and before any bind attempt is processed. Returning `false` makes the global invisible to that client; any attempt to bind an invisible global is treated as a protocol error.
+
+```rust
+use wayland_server::{Client, GlobalDispatch, New, DataInit, DisplayHandle};
+use wayland_server::protocol::wl_compositor::WlCompositor;
+use wayland_server::backend::Credentials;
+
+struct PrivilegedGlobalData {
+    allowed_uid: u32,
+}
+
+impl GlobalDispatch<WlCompositor, AppState> for PrivilegedGlobalData {
+    fn bind(
+        &self,
+        _state:    &mut AppState,
+        _handle:   &DisplayHandle,
+        _client:   &Client,
+        resource:  New<WlCompositor>,
+        data_init: &mut DataInit<'_, AppState>,
+    ) {
+        data_init.init(resource, ());
+    }
+
+    fn can_view(&self, client: &Client) -> bool {
+        // Only allow clients running as a specific UID.
+        // Note: credential-based checks should not be the sole security
+        // mechanism — see the Client credentials documentation.
+        true // replace with actual credential check if needed
+    }
+}
+```
+
+<Note>
+`can_view()` receives only a `&Client`, not the `DisplayHandle`. If you need credentials, store your compositor's `DisplayHandle` somewhere accessible and call `client.get_credentials(&dh)` from state you can reach through `&self`.
+</Note>
+
+A common pattern is to store the `DisplayHandle` in the global user-data so `can_view()` can query credentials:
+
+```rust
+struct XWaylandGlobalData {
+    dh: DisplayHandle,
+    xwayland_pid: u32,
+}
+
+impl GlobalDispatch<WlCompositor, AppState> for XWaylandGlobalData {
+    fn bind(
+        &self,
+        _state:    &mut AppState,
+        _handle:   &DisplayHandle,
+        _client:   &Client,
+        resource:  New<WlCompositor>,
+        data_init: &mut DataInit<'_, AppState>,
+    ) {
+        data_init.init(resource, ());
+    }
+
+    fn can_view(&self, client: &Client) -> bool {
+        client
+            .get_credentials(&self.dh)
+            .map(|creds| creds.pid == self.xwayland_pid)
+            .unwrap_or(false)
+    }
+}
+```
+
+## Disabling and removing globals
+
+Use the `GlobalId` returned by `create_global()` to manage the global's lifecycle.
+
+### Disabling
+
+`disable_global()` sends a `wl_registry.global_remove` event to all connected clients. The global data is **not** freed: clients that already bound it can continue using their resource objects. New clients will not see the global in the registry, and attempts by any client to bind the disabled global receive a protocol error.
+
+```rust
+dh.disable_global::<AppState>(compositor_global_id.clone());
+```
+
+### Removing
+
+`remove_global()` frees the global's state entirely. If the global was not already disabled, it also sends `wl_registry.global_remove` to clients.
+
+```rust
+// Best practice: disable first, then remove after a delay to avoid races.
+dh.remove_global::<AppState>(compositor_global_id);
+```
+
+<Warning>
+If you call `remove_global()` without first calling `disable_global()` and waiting for a round-trip, a client that received the global advertisement but has not yet processed the removal may try to bind the global after it has been removed. The client is killed with a protocol error in that case, which may be surprising. Always prefer: disable → wait → remove.
+</Warning>
+
+## GlobalId
+
+`GlobalId` is an opaque identifier returned by `create_global()` and usable with `disable_global()` and `remove_global()`. It is `Clone` and can be stored in your compositor state alongside any bookkeeping you need.
+
+```rust
+use wayland_server::backend::GlobalId;
+use std::collections::HashMap;
+
+struct CompositorState {
+    globals: HashMap<&'static str, GlobalId>,
+}
+
+impl CompositorState {
+    fn new(dh: &DisplayHandle) -> Self {
+        use wayland_server::protocol::wl_compositor::WlCompositor;
+
+        let compositor_id = dh.create_global::<Self, WlCompositor, _>(4, ());
+
+        let mut globals = HashMap::new();
+        globals.insert("wl_compositor", compositor_id);
+
+        Self { globals }
+    }
+}
+```
+
+## Complete wl_compositor example
+
+The following example shows the full round-trip from advertising a global to handling requests on the bound resource.
+
+```rust
+use wayland_server::{
+    Client, DataInit, Dispatch, DisplayHandle,
+    GlobalDispatch, New, Resource,
+    protocol::{
+        wl_compositor::{self, WlCompositor},
+        wl_surface::{self, WlSurface},
+        wl_region::{self, WlRegion},
+    },
+};
+
+// ── User-data for the global itself ───────────────────────────────────────
+pub struct CompositorGlobal;
+
+impl GlobalDispatch<WlCompositor, AppState> for CompositorGlobal {
+    fn bind(
+        &self,
+        _state:    &mut AppState,
+        _handle:   &DisplayHandle,
+        _client:   &Client,
+        resource:  New<WlCompositor>,
+        data_init: &mut DataInit<'_, AppState>,
+    ) {
+        data_init.init(resource, CompositorHandler);
+    }
+}
+
+// ── User-data for each wl_compositor resource ─────────────────────────────
+pub struct CompositorHandler;
+
+impl Dispatch<WlCompositor, AppState> for CompositorHandler {
+    fn request(
+        &self,
+        _state:    &mut AppState,
+        _client:   &Client,
+        _resource: &WlCompositor,
+        request:   wl_compositor::Request,
+        _dhandle:  &DisplayHandle,
+        data_init: &mut DataInit<'_, AppState>,
+    ) {
+        match request {
+            wl_compositor::Request::CreateSurface { id } => {
+                data_init.init(id, SurfaceData::default());
+            }
+            wl_compositor::Request::CreateRegion { id } => {
+                data_init.init(id, ());
+            }
+            _ => {}
+        }
+    }
+}
+
+// ── Surface and region dispatch omitted for brevity ───────────────────────
+
+fn init_globals(dh: &DisplayHandle) {
+    dh.create_global::<AppState, WlCompositor, _>(6, CompositorGlobal);
+}
+```
+
+## Quick-reference
+
+| Method | Description |
+|---|---|
+| `dh.create_global::<State, I, _>(version, data)` | Advertise a new global; returns `GlobalId` |
+| `dh.disable_global::<State>(id)` | Soft-remove: existing bindings survive |
+| `dh.remove_global::<State>(id)` | Hard-remove: frees state, new binds error |
+| `GlobalDispatch::bind()` | Called on every client bind; must init resource |
+| `GlobalDispatch::can_view()` | Filter which clients see the global |
+| `DataInit::init(new, data)` | Initialize resource with `Dispatch` user-data |
+| `DataInit::post_error(new, code, msg)` | Reject a bind with a protocol error |

@@ -1,0 +1,311 @@
+---
+title: "Get started with wayland-server in Rust"
+sidebarTitle: "Quickstart"
+description: "Build a Wayland compositor in Rust using wayland-server. Set up a Display, advertise globals, accept clients, and dispatch requests in minutes."
+---
+
+`wayland-server` is the Rust crate that powers the server side of the Wayland protocol. It provides the building blocks every compositor needs: a typed `Display<State>` that owns all protocol state, a `ListeningSocket` that accepts incoming client connections, `GlobalDispatch` for advertising capabilities, and `Dispatch` for routing client requests to your application logic. This guide walks through each step and finishes with a complete, runnable compositor skeleton.
+
+## Add wayland-server to your project
+
+<Steps>
+
+### Add the dependency
+
+Open your `Cargo.toml` and add `wayland-server`. Choose the features that match your deployment target.
+
+```toml Cargo.toml
+[package]
+name    = "my-compositor"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+wayland-server = { version = "0.31", features = ["system"] }
+
+[features]
+# Use the system libwayland-server.so instead of the built-in Rust backend
+system = ["wayland-server/system"]
+# dlopen: load libwayland-server.so at runtime instead of link time
+dlopen = ["wayland-server/dlopen"]
+# Opt-in API additions available in libwayland >= 1.22
+libwayland_1_22 = ["wayland-server/libwayland_1_22"]
+# Opt-in API additions available in libwayland >= 1.23 (implies libwayland_1_22)
+libwayland_1_23 = ["wayland-server/libwayland_1_23"]
+```
+
+<Note>
+Without any features `wayland-server` uses an internal pure-Rust backend and does **not** require `libwayland-server.so` to be installed. Enable `system` (or `dlopen`) only if you need FFI interop, e.g. passing raw `wl_display` pointers to Mesa.
+</Note>
+
+### Create Display\<State\>
+
+`Display<State>` owns the entire protocol state of your compositor. The type parameter `State` is your application-level struct — every callback receives a `&mut State`.
+
+```rust main.rs
+use wayland_server::Display;
+
+struct AppState {
+    // your compositor fields go here
+    running: bool,
+}
+
+fn main() -> std::io::Result<()> {
+    let mut display: Display<AppState> = Display::new()
+        .expect("Failed to create Wayland display");
+
+    let mut state = AppState { running: true };
+
+    // ...
+    Ok(())
+}
+```
+
+### Create a ListeningSocket
+
+`ListeningSocket` manages the Unix-domain socket that clients connect to. It creates the socket file inside `$XDG_RUNTIME_DIR` and holds an exclusive lockfile for the lifetime of the process.
+
+```rust main.rs
+use wayland_server::ListeningSocket;
+
+let socket = ListeningSocket::bind("wayland-0")
+    .expect("Failed to bind wayland-0");
+
+// Or auto-select the first free slot: wayland-1, wayland-2, …
+// let socket = ListeningSocket::bind_auto("wayland", 0..=9).unwrap();
+
+println!("Listening on {:?}", socket.socket_name());
+```
+
+<Tip>
+Clients discover the compositor socket via the `WAYLAND_DISPLAY` environment variable. Set it to the socket name after binding so child processes (your clients) find your compositor automatically.
+</Tip>
+
+### Implement GlobalDispatch for your globals
+
+Every capability you expose to clients is a *global*. Implement `GlobalDispatch<Interface, State>` on the user-data type you pass to `create_global()`. When a client calls `wl_registry.bind`, the `bind()` method is invoked and you must initialize the newly created resource.
+
+```rust globals.rs
+use wayland_server::{
+    Client, DataInit, DisplayHandle, GlobalDispatch, New,
+    protocol::wl_compositor::WlCompositor,
+};
+
+pub struct CompositorState;
+
+impl GlobalDispatch<WlCompositor, AppState> for CompositorState {
+    fn bind(
+        &self,
+        state:     &mut AppState,
+        _handle:   &DisplayHandle,
+        _client:   &Client,
+        resource:  New<WlCompositor>,
+        data_init: &mut DataInit<'_, AppState>,
+    ) {
+        // Initialize the resource with per-object user data.
+        // Failing to call data_init.init() here causes a panic.
+        data_init.init(resource, ());
+    }
+}
+```
+
+### Implement Dispatch for resources
+
+`Dispatch<Resource, State>` is implemented on your user-data type and drives per-request handling. Every incoming request from a client arrives here.
+
+```rust dispatch.rs
+use wayland_server::{
+    Client, DataInit, Dispatch, DisplayHandle, Resource,
+    protocol::wl_compositor::{self, WlCompositor},
+};
+
+impl Dispatch<WlCompositor, AppState> for () {
+    fn request(
+        &self,
+        state:     &mut AppState,
+        _client:   &Client,
+        resource:  &WlCompositor,
+        request:   wl_compositor::Request,
+        dhandle:   &DisplayHandle,
+        data_init: &mut DataInit<'_, AppState>,
+    ) {
+        match request {
+            wl_compositor::Request::CreateSurface { id } => {
+                // id is a New<WlSurface> — must be initialized
+                data_init.init(id, ());
+            }
+            wl_compositor::Request::CreateRegion { id } => {
+                data_init.init(id, ());
+            }
+            _ => {}
+        }
+    }
+}
+```
+
+### Run the event loop
+
+Wire the `Display` file descriptor and the `ListeningSocket` file descriptor into your preferred event loop (here shown with a simple `poll`-based loop). Call `dispatch_clients()` whenever the display fd becomes readable and `flush_clients()` after every iteration.
+
+```rust main.rs
+use std::os::unix::io::AsFd;
+use wayland_server::{Display, ListeningSocket};
+
+fn run(mut display: Display<AppState>, socket: ListeningSocket, mut state: AppState) {
+    loop {
+        // Accept any newly connected clients
+        if let Some(stream) = socket.accept().unwrap() {
+            let client_data = std::sync::Arc::new(MyClientData);
+            display.handle().insert_client(stream, client_data)
+                .expect("Failed to insert client");
+        }
+
+        // Dispatch all pending requests from every client
+        display.dispatch_clients(&mut state).unwrap();
+
+        // Flush outbound event queues
+        display.flush_clients().unwrap();
+
+        if !state.running {
+            break;
+        }
+    }
+}
+```
+
+</Steps>
+
+## Complete minimal compositor skeleton
+
+The snippet below combines all the pieces above into a single file that compiles and accepts connections. It does not implement any real rendering — that is left to higher-level crates such as [Smithay](https://github.com/smithay/smithay) — but it demonstrates the full structural skeleton of a `wayland-server` compositor.
+
+```rust main.rs
+use std::sync::Arc;
+use wayland_server::{
+    Client, DataInit, Dispatch, Display, DisplayHandle,
+    GlobalDispatch, ListeningSocket, New, Resource,
+    backend::{ClientData, ClientId, DisconnectReason},
+    protocol::{
+        wl_compositor::{self, WlCompositor},
+        wl_surface::{self, WlSurface},
+    },
+};
+
+// ── Application state ──────────────────────────────────────────────────────
+struct AppState {
+    running: bool,
+}
+
+// ── Per-client data ────────────────────────────────────────────────────────
+struct MyClientData;
+
+impl ClientData for MyClientData {
+    fn initialized(&self, _id: ClientId) {
+        println!("Client connected");
+    }
+    fn disconnected(&self, _id: ClientId, _reason: DisconnectReason) {
+        println!("Client disconnected");
+    }
+}
+
+// ── GlobalDispatch: wl_compositor ──────────────────────────────────────────
+impl GlobalDispatch<WlCompositor, AppState> for () {
+    fn bind(
+        &self,
+        _state:    &mut AppState,
+        _handle:   &DisplayHandle,
+        _client:   &Client,
+        resource:  New<WlCompositor>,
+        data_init: &mut DataInit<'_, AppState>,
+    ) {
+        data_init.init(resource, ());
+    }
+}
+
+// ── Dispatch: wl_compositor ────────────────────────────────────────────────
+impl Dispatch<WlCompositor, AppState> for () {
+    fn request(
+        &self,
+        _state:    &mut AppState,
+        _client:   &Client,
+        _resource: &WlCompositor,
+        request:   wl_compositor::Request,
+        _dhandle:  &DisplayHandle,
+        data_init: &mut DataInit<'_, AppState>,
+    ) {
+        match request {
+            wl_compositor::Request::CreateSurface { id } => {
+                data_init.init(id, ());
+            }
+            wl_compositor::Request::CreateRegion { id } => {
+                data_init.init(id, ());
+            }
+            _ => {}
+        }
+    }
+}
+
+// ── Dispatch: wl_surface ───────────────────────────────────────────────────
+impl Dispatch<WlSurface, AppState> for () {
+    fn request(
+        &self,
+        _state:    &mut AppState,
+        _client:   &Client,
+        _resource: &WlSurface,
+        request:   wl_surface::Request,
+        _dhandle:  &DisplayHandle,
+        _data_init: &mut DataInit<'_, AppState>,
+    ) {
+        match request {
+            wl_surface::Request::Commit => {
+                // handle surface commit
+            }
+            _ => {}
+        }
+    }
+}
+
+// ── Entry point ────────────────────────────────────────────────────────────
+fn main() {
+    let mut display: Display<AppState> = Display::new().unwrap();
+    let mut state = AppState { running: true };
+
+    // Advertise wl_compositor at version 4
+    display.handle().create_global::<AppState, WlCompositor, _>(4, ());
+
+    let socket = ListeningSocket::bind("wayland-0")
+        .expect("Could not bind wayland-0");
+    println!("Compositor listening on {:?}", socket.socket_name());
+
+    loop {
+        if let Some(stream) = socket.accept().unwrap() {
+            display.handle()
+                .insert_client(stream, Arc::new(MyClientData))
+                .unwrap();
+        }
+        display.dispatch_clients(&mut state).unwrap();
+        display.flush_clients().unwrap();
+
+        if !state.running {
+            break;
+        }
+    }
+}
+```
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Display & DisplayHandle" href="/server/display">
+    Deep-dive into Display creation, polling, and the DisplayHandle API.
+  </Card>
+  <Card title="Advertising globals" href="/server/globals">
+    Control which clients see which globals with GlobalDispatch and can_view().
+  </Card>
+  <Card title="Request dispatch" href="/server/dispatch">
+    Handle requests, send events, and post protocol errors with Dispatch.
+  </Card>
+  <Card title="Managing clients" href="/server/clients">
+    Accept connections, read credentials, and disconnect clients safely.
+  </Card>
+</CardGroup>

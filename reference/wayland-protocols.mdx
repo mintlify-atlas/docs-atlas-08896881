@@ -1,0 +1,279 @@
+---
+title: "wayland-protocols crate reference"
+sidebarTitle: "wayland-protocols"
+description: "Reference for wayland-protocols 0.32: stable, staging, and unstable Wayland extension protocols organized by namespace (xdg, wp, ext, xwayland)."
+---
+
+The `wayland-protocols` crate provides generated Rust bindings for the official Wayland protocol extensions maintained at [gitlab.freedesktop.org/wayland/wayland-protocols](https://gitlab.freedesktop.org/wayland/wayland-protocols). These bindings are layered on top of `wayland-client` and `wayland-server`, giving you typed access to extension interfaces — from XDG shell window management to presentation timing and session locking.
+
+<Tip>
+  Full rustdoc documentation is available at [docs.rs/wayland-protocols](https://docs.rs/wayland-protocols/).
+</Tip>
+
+## Installation
+
+Add `wayland-protocols` to your `Cargo.toml`. You must enable at least one side feature (`client` or `server`) and, for non-stable protocols, the appropriate tier feature (`staging` or `unstable`):
+
+```toml
+[dependencies]
+# Client-side bindings for stable and staging protocols
+wayland-protocols = { version = "0.32", features = ["client", "staging"] }
+```
+
+```toml
+[dependencies]
+# Server-side bindings with all tiers
+wayland-protocols = { version = "0.32", features = ["server", "staging", "unstable"] }
+```
+
+### Feature flags
+
+| Feature | Description |
+|---|---|
+| `client` | Generate client-side (`wayland-client`) bindings. Adds a `client` submodule under each protocol module. |
+| `server` | Generate server-side (`wayland-server`) bindings. Adds a `server` submodule under each protocol module. |
+| `staging` | Include staging-tier protocols (ready for wider adoption but potentially replaced in a future major version). |
+| `unstable` | Include legacy unstable protocols (identified by `z` prefix interfaces). Deprecated; prefer stable or staging equivalents where available. |
+
+You can enable both `client` and `server` simultaneously to use the same protocol definitions from both sides.
+
+---
+
+## Stability tiers
+
+Protocols in this crate are organised into three stability tiers, reflecting how mature and settled the protocol specification is.
+
+<Tabs>
+  <Tab title="Stable">
+    Stable protocols are finalized and will not receive incompatible changes. They are unconditionally compiled and need no extra feature flag.
+
+    **Examples:** `xdg_shell`, `presentation_time`, `viewporter`, `linux_dmabuf`, `tablet` (v2).
+  </Tab>
+  <Tab title="Staging">
+    Staging protocols are ready for broad adoption. Compositors and clients are encouraged to implement them, but the specification may still be replaced in a future major version of `wayland-protocols`. Enable with the `staging` Cargo feature.
+
+    **Examples:** `xdg_activation_v1`, `fractional_scale_v1`, `ext_session_lock_v1`, `ext_idle_notify_v1`, `drm_lease_v1`, `xwayland_shell_v1`.
+  </Tab>
+  <Tab title="Unstable">
+    Unstable (legacy) protocols were protocols in active development under the old naming scheme. They are recognized by the `z` prefix on their interface names (e.g. `zwp_pointer_constraints_v1`). This category is **deprecated** — no new protocols should use it. Enable with the `unstable` Cargo feature.
+
+    **Examples:** `zwp_pointer_constraints_v1`, `zwp_relative_pointer_v1`, `zxdg_decoration_v1`, `zwp_tablet_v1`.
+  </Tab>
+</Tabs>
+
+<Note>
+  The `unstable` category is distinct from "experimental" or "broken" — many unstable protocols are widely supported in the ecosystem. However, they may eventually be replaced by staging or stable equivalents.
+</Note>
+
+---
+
+## Protocol namespaces
+
+The crate is organized into four top-level modules, each grouping related protocol families. Every protocol module contains `client` and/or `server` submodules (gated on the `client` / `server` features).
+
+### `wayland_protocols::xdg` — Window management
+
+Protocols specifically related to window management and desktop shell functionality.
+
+| Module path | Protocol | Tier | Description |
+|---|---|---|---|
+| `xdg::shell` | `xdg_shell` | Stable | Core XDG shell protocol. Provides `xdg_wm_base`, `xdg_surface`, `xdg_toplevel`, and `xdg_popup`. The standard replacement for `wl_shell`. |
+| `xdg::activation::v1` | `xdg_activation_v1` | Staging | Mechanism for a client to pass focus (activation token) to another toplevel. |
+| `xdg::decoration::zv1` | `zxdg_decoration_v1` | Unstable | Negotiate server-side vs. client-side window decorations. |
+| `xdg::foreign::zv1` | `zxdg_foreign_v1` | Unstable | Export/import surface handles across clients (e.g. for out-of-process dialogs). |
+| `xdg::foreign::zv2` | `zxdg_foreign_v2` | Unstable | Version 2 of the XDG foreign protocol. |
+| `xdg::xdg_output::zv1` | `zxdg_output_v1` | Unstable | Richer output description: logical position, size, connector name. |
+| `xdg::toplevel_drag::v1` | `xdg_toplevel_drag_v1` | Staging | Attach an `xdg_toplevel` to a drag-and-drop operation, enabling detachable window panes. |
+| `xdg::dialog::v1` | `xdg_dialog_v1` | Staging | Mark an `xdg_toplevel` as a dialog relative to another toplevel. |
+| `xdg::toplevel_icon::v1` | `xdg_toplevel_icon_v1` | Staging | Set per-toplevel icons from icon stock names or pixel data. |
+| `xdg::toplevel_tag::v1` | `xdg_toplevel_tag_v1` | Staging | Assign a persistent tag to toplevels for compositor rules and position memory. |
+| `xdg::system_bell::v1` | `xdg_system_bell_v1` | Staging | Ring the system bell from a client. |
+
+**Example — binding `xdg_wm_base` on the client:**
+
+```rust
+use wayland_protocols::xdg::shell::client::xdg_wm_base;
+
+// After obtaining `globals` from registry_queue_init:
+let wm_base: xdg_wm_base::XdgWmBase =
+    globals.bind(&queue.handle(), 1..=6, ()).unwrap();
+```
+
+**Example — using the `client` submodule path:**
+
+```rust
+// General pattern:
+// wayland_protocols::<namespace>::<protocol>::client::<interface_module>::<InterfaceType>
+
+use wayland_protocols::xdg::shell::client::{
+    xdg_wm_base::XdgWmBase,
+    xdg_surface::XdgSurface,
+    xdg_toplevel::XdgToplevel,
+};
+```
+
+---
+
+### `wayland_protocols::wp` — General purpose
+
+General-purpose Wayland extension protocols not specific to any single subsystem.
+
+| Module path | Protocol | Tier | Description |
+|---|---|---|---|
+| `wp::presentation_time` | `wp_presentation` | Stable | Precise feedback on presentation (flip) timing for smooth video playback and animations. |
+| `wp::viewporter` | `wp_viewport` | Stable | Scale and crop `wl_surface` contents independently of buffer size. |
+| `wp::linux_dmabuf::zv1` | `zwp_linux_dmabuf_v1` | Stable | Import DMA-BUF hardware buffers as Wayland buffers for zero-copy rendering. |
+| `wp::tablet::zv1` | `zwp_tablet_v1` | Stable (zv1 XML) | Graphics tablet protocol v1 (legacy; prefer `zv2`). |
+| `wp::tablet::zv2` | `zwp_tablet_v2` | Stable | Graphics tablet protocol v2: tablets, tools, pads. |
+| `wp::fractional_scale::v1` | `wp_fractional_scale_v1` | Staging | Compositor hint for fractional HiDPI scaling factors. |
+| `wp::color_management::v1` | `wp_color_management_v1` | Staging | Describe color properties (SDR/HDR colorimetry) for surfaces and outputs. |
+| `wp::color_representation::v1` | `wp_color_representation_v1` | Staging | Describe YCbCr pixel format conversion parameters. |
+| `wp::content_type::v1` | `wp_content_type_v1` | Staging | Hint at the kind of content a surface will display (game, video, photo, etc.). |
+| `wp::cursor_shape::v1` | `wp_cursor_shape_v1` | Staging | Set a cursor from a named icon stock instead of a custom surface. |
+| `wp::drm_lease::v1` | `wp_drm_lease_v1` | Staging | Lease DRM resources from a compositor for direct rendering (e.g. VR headsets). |
+| `wp::tearing_control::v1` | `wp_tearing_control_v1` | Staging | Opt into tearing page flips for lower-latency rendering. |
+| `wp::single_pixel_buffer::v1` | `wp_single_pixel_buffer_v1` | Staging | Create a single-pixel `wl_buffer` (combine with `viewporter` to fill solid-color regions). |
+| `wp::security_context::v1` | `wp_security_context_v1` | Staging | Attach a security context to a new Wayland connection (for sandboxes). |
+| `wp::alpha_modifier::v1` | `wp_alpha_modifier_v1` | Staging | Apply a global alpha factor to a surface, offloaded to the compositor or KMS. |
+| `wp::linux_drm_syncobj::v1` | `wp_linux_drm_syncobj_v1` | Staging | Explicit GPU synchronization using DRM syncobj timeline points. |
+| `wp::fifo::v1` | `wp_fifo_v1` | Staging | Add a display-refresh-cycle readiness constraint to surface commits. |
+| `wp::commit_timing::v1` | `wp_commit_timing_v1` | Staging | Schedule surface commits to be presented no earlier than a given time. |
+| `wp::pointer_warp::v1` | `wp_pointer_warp_v1` | Staging | Request the pointer be moved to a position relative to a surface. |
+| `wp::fullscreen_shell::zv1` | `zwp_fullscreen_shell_v1` | Unstable | Display a surface full-screen without desktop shell management. |
+| `wp::idle_inhibit::zv1` | `zwp_idle_inhibit_v1` | Unstable | Inhibit the compositor's idle/screensaver behaviour. |
+| `wp::input_method::zv1` | `zwp_input_method_v1` | Unstable | Input method protocol (e.g. on-screen keyboards). |
+| `wp::input_timestamps::zv1` | `zwp_input_timestamps_v1` | Unstable | High-resolution timestamps for input events. |
+| `wp::keyboard_shortcuts_inhibit::zv1` | `zwp_keyboard_shortcuts_inhibit_v1` | Unstable | Request the compositor forward all keyboard events to a surface. |
+| `wp::linux_explicit_synchronization::zv1` | `zwp_linux_explicit_synchronization_v1` | Unstable | Older explicit sync protocol (pre-syncobj). |
+| `wp::pointer_constraints::zv1` | `zwp_pointer_constraints_v1` | Unstable | Confine or lock the pointer to a region or position. |
+| `wp::pointer_gestures::zv1` | `zwp_pointer_gestures_v1` | Unstable | Multi-touch pointer gesture events (swipe, pinch). |
+| `wp::primary_selection::zv1` | `zwp_primary_selection_v1` | Unstable | X11-style primary (middle-click) selection clipboard. |
+| `wp::relative_pointer::zv1` | `zwp_relative_pointer_v1` | Unstable | Unaccelerated relative pointer motion events (for FPS games). |
+| `wp::text_input::zv1` | `zwp_text_input_v1` | Unstable | Text input interface v1. |
+| `wp::text_input::zv3` | `zwp_text_input_v3` | Unstable | Text input interface v3. |
+
+---
+
+### `wayland_protocols::ext` — Miscellaneous extensions
+
+Protocols that do not fit into the `xdg` or `wp` categories — often privileged compositor extensions.
+
+| Module path | Protocol | Tier | Description |
+|---|---|---|---|
+| `ext::session_lock::v1` | `ext_session_lock_v1` | Staging | Allow a privileged client to lock the session and display custom graphics. |
+| `ext::idle_notify::v1` | `ext_idle_notify_v1` | Staging | Receive notifications when the user becomes idle or active. |
+| `ext::foreign_toplevel_list::v1` | `ext_foreign_toplevel_list_v1` | Staging | Enumerate toplevel windows from other clients (for taskbars, overview UIs). |
+| `ext::transient_seat::v1` | `ext_transient_seat_v1` | Staging | Create independent temporary seats (for virtual input, remote desktop). |
+| `ext::image_capture_source::v1` | `ext_image_capture_source_v1` | Staging | Intermediary object for referencing capture sources (outputs, toplevels). |
+| `ext::image_copy_capture::v1` | `ext_image_copy_capture_v1` | Staging | Capture output or toplevel frames into client-provided buffers (screencopy). |
+| `ext::data_control::v1` | `ext_data_control_v1` | Staging | Privileged control of data devices, including the clipboard. |
+| `ext::workspace::v1` | `ext_workspace_v1` | Staging | List and control workspaces/virtual desktops. |
+| `ext::background_effect::v1` | `ext_background_effect_v1` | Staging | Apply visual effects (blur, etc.) to the background behind translucent surfaces. |
+
+---
+
+### `wayland_protocols::xwayland` — XWayland protocols
+
+Protocols specifically for interoperability between XWayland and Wayland compositors.
+
+| Module path | Protocol | Tier | Description |
+|---|---|---|---|
+| `xwayland::shell::v1` | `xwayland_shell_v1` | Staging | Associate an X11 window with a `wl_surface` without the race condition of the old `WL_SURFACE_ID` client message approach. |
+| `xwayland::keyboard_grab::zv1` | `zwp_xwayland_keyboard_grab_v1` | Unstable | Allow XWayland to request that all keyboard events be forwarded to a specific surface (implementing X11 active keyboard grabs). |
+
+---
+
+## Module path patterns
+
+All protocol bindings follow a consistent module path convention:
+
+```
+wayland_protocols::<namespace>::<protocol_name>[::version]::<side>::<interface_module>::<Type>
+```
+
+<CodeGroup>
+```rust Stable protocol (client)
+// wayland_protocols::xdg::shell::client::xdg_wm_base::XdgWmBase
+use wayland_protocols::xdg::shell::client::xdg_wm_base::XdgWmBase;
+```
+
+```rust Staging protocol (client)
+// wayland_protocols::wp::fractional_scale::v1::client::wp_fractional_scale_v1::WpFractionalScaleV1
+use wayland_protocols::wp::fractional_scale::v1::client::wp_fractional_scale_v1::WpFractionalScaleV1;
+```
+
+```rust Unstable protocol (client)
+// wayland_protocols::wp::pointer_constraints::zv1::client::zwp_pointer_constraints_v1::ZwpPointerConstraintsV1
+use wayland_protocols::wp::pointer_constraints::zv1::client::zwp_pointer_constraints_v1::ZwpPointerConstraintsV1;
+```
+
+```rust Server-side protocol
+// wayland_protocols::xdg::shell::server::xdg_wm_base::XdgWmBase
+use wayland_protocols::xdg::shell::server::xdg_wm_base::XdgWmBase;
+```
+</CodeGroup>
+
+### Common examples
+
+```rust
+// Core window management
+use wayland_protocols::xdg::shell::client::{
+    xdg_wm_base::XdgWmBase,
+    xdg_surface::XdgSurface,
+    xdg_toplevel::XdgToplevel,
+    xdg_popup::XdgPopup,
+};
+
+// Presentation timing (video, animation)
+use wayland_protocols::wp::presentation_time::client::wp_presentation::WpPresentation;
+
+// Viewport/scale
+use wayland_protocols::wp::viewporter::client::wp_viewporter::WpViewporter;
+
+// DMA-BUF (hardware buffer import)
+use wayland_protocols::wp::linux_dmabuf::zv1::client::zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1;
+
+// Session lock (staging)
+use wayland_protocols::ext::session_lock::v1::client::ext_session_lock_v1::ExtSessionLockV1;
+
+// Fractional scaling hint (staging)
+use wayland_protocols::wp::fractional_scale::v1::client::wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1;
+```
+
+---
+
+## Using protocols with `GlobalList`
+
+The typical pattern for binding an extension global on the client side:
+
+```toml
+[dependencies]
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client", "staging"] }
+```
+
+```rust
+use wayland_client::{globals::registry_queue_init, Connection};
+use wayland_protocols::xdg::shell::client::xdg_wm_base::XdgWmBase;
+
+let conn = Connection::connect_to_env().unwrap();
+let (globals, mut queue) = registry_queue_init::<MyState>(&conn).unwrap();
+
+// Bind xdg_wm_base at version 1 through 6, panics if not present
+let wm_base: XdgWmBase = globals.bind(&queue.handle(), 1..=6, ()).unwrap();
+```
+
+---
+
+## Related crates
+
+`wayland-protocols` covers only the protocols maintained in the upstream `wayland-protocols` repository. Additional protocol bindings are available in separate crates:
+
+| Crate | Description | docs.rs |
+|---|---|---|
+| [`wayland-protocols-wlr`](https://crates.io/crates/wayland-protocols-wlr) | wlroots-specific protocol extensions (layer shell, screencopy, output management, etc.) | [docs.rs/wayland-protocols-wlr](https://docs.rs/wayland-protocols-wlr) |
+| [`wayland-protocols-plasma`](https://crates.io/crates/wayland-protocols-plasma) | KDE Plasma-specific Wayland protocol extensions | [docs.rs/wayland-protocols-plasma](https://docs.rs/wayland-protocols-plasma) |
+| [`wayland-protocols-misc`](https://crates.io/crates/wayland-protocols-misc) | Miscellaneous additional protocols not in the above collections | [docs.rs/wayland-protocols-misc](https://docs.rs/wayland-protocols-misc) |
+| [`wayland-protocols-experimental`](https://crates.io/crates/wayland-protocols-experimental) | Highly experimental protocols still under active design | [docs.rs/wayland-protocols-experimental](https://docs.rs/wayland-protocols-experimental) |
+
+All of these follow the same module path pattern and `client` / `server` feature conventions as `wayland-protocols`.

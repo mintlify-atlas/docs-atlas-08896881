@@ -1,0 +1,206 @@
+---
+title: "Loading cursor themes with wayland-cursor"
+sidebarTitle: "Cursor Themes"
+description: "wayland-cursor loads XCursor images from system themes into WlBuffers, with metadata for animated cursor support in Wayland clients."
+---
+
+The `wayland-cursor` crate gives Wayland clients a pure-Rust way to load and display cursor images from system XCursor themes. Rather than delegating to the C `libwayland-cursor` library, it parses XCursor files directly using the [`xcursor`](https://crates.io/crates/xcursor) crate and allocates shared memory with [`rustix`](https://crates.io/crates/rustix), writing pixel data into a `wl_shm_pool` that the compositor can read. The resulting [`CursorImageBuffer`] values dereference to [`WlBuffer`], so you attach them to a `wl_surface` just like any other buffer. Animated cursors are supported through frame-timing helpers that tell you which frame to show and for how long.
+
+## Adding the dependency
+
+```toml
+[dependencies]
+wayland-cursor = "0.31"
+wayland-client = "0.31"
+```
+
+`wayland-cursor` requires no system libraries beyond a working Wayland connection — it does **not** link against `libwayland-cursor.so`. Shared memory is allocated via `memfd_create` on Linux and Android, falling back to POSIX `shm_open` on other platforms.
+
+## Loading a cursor theme
+
+<Steps>
+
+### Create a `CursorTheme`
+
+[`CursorTheme::load()`] is the simplest entry point. It reads the `XCURSOR_THEME` and `XCURSOR_SIZE` environment variables (falling back to `"default"` and the supplied size if they are absent) and allocates a shared-memory pool large enough to hold the cursor images.
+
+```rust
+use wayland_cursor::CursorTheme;
+use wayland_client::{Connection, protocol::wl_shm::WlShm};
+
+fn setup_cursor_theme(conn: &Connection, shm: WlShm) -> CursorTheme {
+    // Reads XCURSOR_THEME / XCURSOR_SIZE from the environment.
+    // Falls back to theme name "default" and size 32.
+    CursorTheme::load(conn, shm, 32)
+        .expect("Could not load cursor theme")
+}
+```
+
+Use [`CursorTheme::load_or()`] when you want to supply a specific fallback name:
+
+```rust
+// Use "Adwaita" if XCURSOR_THEME is not set.
+let theme = CursorTheme::load_or(conn, shm, "Adwaita", 24)?;
+```
+
+And [`CursorTheme::load_from_name()`] when you want to bypass environment variables entirely:
+
+```rust
+// Always use "Breeze" at 48 px regardless of environment.
+let theme = CursorTheme::load_from_name(conn, shm, "Breeze", 48)?;
+```
+
+### Retrieve a cursor by name
+
+Call [`CursorTheme::get_cursor()`] with an XCursor name such as `"default"`, `"text"`, or `"wait"`. The method loads the cursor from the system theme on first call and caches it for subsequent calls. It returns `None` if the cursor is not provided by the theme or any of its parents.
+
+```rust
+let cursor = theme
+    .get_cursor("wait")
+    .expect("'wait' cursor not provided by theme");
+```
+
+### Handle missing cursors with a fallback
+
+If the system theme does not provide a cursor you need, register a fallback closure with [`CursorTheme::set_fallback()`]. The closure receives the cursor name and size and must return raw XCursor file bytes or `None`.
+
+```rust
+use std::borrow::Cow;
+
+theme.set_fallback(|name, _size| {
+    // Embed a hand-crafted xcursor file at compile time.
+    if name == "my-custom-cursor" {
+        Some(Cow::Borrowed(include_bytes!("assets/my-custom-cursor")))
+    } else {
+        None
+    }
+});
+```
+
+</Steps>
+
+## Displaying cursor frames
+
+A [`Cursor`] can contain multiple images when the cursor is animated. Use [`Cursor::image_count()`] to query how many frames are available, and index the cursor with `cursor[i]` to obtain a [`CursorImageBuffer`] for each frame.
+
+```rust
+println!("{} frame(s) in this cursor", cursor.image_count());
+
+// Access the first frame's WlBuffer (CursorImageBuffer derefs to WlBuffer).
+let first_frame: &wayland_client::protocol::wl_buffer::WlBuffer = &cursor[0];
+```
+
+### Animating cursors
+
+[`Cursor::frame_and_duration()`] takes elapsed milliseconds and returns a [`FrameAndDuration`] value containing:
+- `frame_index` — which image to display
+- `frame_duration` — how many more milliseconds that frame should remain on screen
+
+Time wraps automatically, so you can pass a monotonically increasing clock value without manual modulo arithmetic.
+
+```rust
+use std::time::{Duration, Instant};
+use std::thread::sleep;
+
+let start = Instant::now();
+
+loop {
+    let millis = start.elapsed().as_millis() as u32;
+    let fr = cursor.frame_and_duration(millis);
+
+    // cursor[fr.frame_index] is a CursorImageBuffer, which Derefs to WlBuffer.
+    let buffer = &cursor[fr.frame_index];
+
+    cursor_surface.attach(Some(buffer), 0, 0);
+    cursor_surface.damage_buffer(0, 0, i32::MAX, i32::MAX);
+    cursor_surface.commit();
+
+    sleep(Duration::from_millis(fr.frame_duration as u64));
+}
+```
+
+## `CursorImageBuffer` metadata
+
+Each [`CursorImageBuffer`] carries the image dimensions and the hotspot position — the pixel coordinate within the image that represents the actual pointer tip.
+
+```rust
+let buffer = &cursor[0];
+
+let (width, height) = buffer.dimensions();
+let (hotspot_x, hotspot_y) = buffer.hotspot();
+let delay_ms = buffer.delay();
+
+println!("Frame size: {width}×{height}, hotspot: ({hotspot_x}, {hotspot_y}), shown for {delay_ms} ms");
+```
+
+<Note>
+Pass the hotspot coordinates to [`wl_pointer.set_cursor`](https://wayland.app/protocols/wayland#wl_pointer:request:set_cursor) so the compositor places the image correctly relative to the pointer position.
+</Note>
+
+## Complete usage example
+
+```rust
+use std::borrow::Cow;
+use std::time::{Duration, Instant};
+use std::thread::sleep;
+
+use wayland_cursor::CursorTheme;
+use wayland_client::{
+    Connection,
+    protocol::{wl_shm::WlShm, wl_surface::WlSurface},
+};
+
+fn run_cursor(conn: &Connection, shm: WlShm, cursor_surface: &WlSurface) {
+    // Load the system cursor theme (respects XCURSOR_THEME / XCURSOR_SIZE).
+    let mut theme = CursorTheme::load(conn, shm, 32)
+        .expect("Failed to load cursor theme");
+
+    // Provide a built-in fallback for any missing cursor.
+    theme.set_fallback(|_name, _size| {
+        // Return raw xcursor bytes, or None to give up.
+        None::<Cow<'static, [u8]>>
+    });
+
+    // Retrieve the animated "wait" cursor.
+    let cursor = theme
+        .get_cursor("wait")
+        .expect("'wait' cursor not in theme");
+
+    let (hx, hy) = cursor[0].hotspot();
+    println!("Hotspot: ({hx}, {hy})");
+
+    // Animate the cursor for 5 seconds.
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(5) {
+        let millis = start.elapsed().as_millis() as u32;
+        let fr = cursor.frame_and_duration(millis);
+
+        cursor_surface.attach(Some(&cursor[fr.frame_index]), 0, 0);
+        cursor_surface.damage_buffer(0, 0, i32::MAX, i32::MAX);
+        cursor_surface.commit();
+
+        sleep(Duration::from_millis(fr.frame_duration as u64));
+    }
+}
+```
+
+## API summary
+
+| Type / Method | Description |
+|---|---|
+| `CursorTheme::load(conn, shm, size)` | Load the system theme; respects `XCURSOR_THEME` / `XCURSOR_SIZE` |
+| `CursorTheme::load_or(conn, shm, name, size)` | Load with a named fallback theme |
+| `CursorTheme::load_from_name(conn, shm, name, size)` | Load a specific theme, ignoring env vars |
+| `CursorTheme::get_cursor(name)` | Retrieve a `Cursor` by XCursor name |
+| `CursorTheme::set_fallback(fn)` | Provide raw XCursor bytes for missing cursors |
+| `Cursor::frame_and_duration(millis)` | Get the current frame index and remaining display time |
+| `Cursor::image_count()` | Total number of animation frames |
+| `cursor[i]` | Index into a `CursorImageBuffer` |
+| `CursorImageBuffer::dimensions()` | `(width, height)` in pixels |
+| `CursorImageBuffer::hotspot()` | `(x, y)` pointer hotspot |
+| `CursorImageBuffer::delay()` | Frame display duration in milliseconds |
+| `Deref<Target = WlBuffer>` | Attach the buffer to a `wl_surface` directly |
+
+<Tip>
+`wayland-cursor` is a pure-Rust reimplementation of `libwayland-cursor`. You do not need the C library installed — everything is handled through the `xcursor` parser and a `wl_shm_pool` that the compositor maps into its own address space.
+</Tip>

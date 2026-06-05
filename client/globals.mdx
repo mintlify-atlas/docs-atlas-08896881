@@ -1,0 +1,326 @@
+---
+title: "Discovering and binding Wayland globals"
+sidebarTitle: "Globals"
+description: "Wayland globals advertise compositor capabilities. Learn to discover, filter, and bind globals using wl_registry and the GlobalList helper."
+---
+
+Every capability a Wayland compositor exposes—surfaces, seats, outputs, shared memory, XDG shell—is advertised as a *global* through `wl_registry`. Before your client can use any protocol object it must first discover the matching global and *bind* it to create a local proxy. `wayland-client` offers two levels of abstraction for this task: the raw `WlRegistry` + `Dispatch` pattern for full control, and the higher-level `GlobalList` / `registry_queue_init` helper for the common case.
+
+## The `wl_registry` pattern
+
+At the wire level, globals work like this:
+
+1. The client sends `wl_display.get_registry`, creating a `WlRegistry` object.
+2. The compositor responds with a stream of `wl_registry.global` events, one per available global.
+3. The client calls `wl_registry.bind` to instantiate a particular global as a local proxy.
+4. Later, if a global is removed (for example a monitor is unplugged), the compositor sends `wl_registry.global_remove`.
+
+### Raw registry pattern
+
+Implementing `Dispatch<WlRegistry, _>` directly gives you complete control:
+
+```rust
+use wayland_client::{
+    protocol::wl_registry, Connection, Dispatch, QueueHandle,
+};
+
+struct AppState {
+    compositor_name: Option<u32>,
+}
+
+impl Dispatch<wl_registry::WlRegistry, ()> for AppState {
+    fn event(
+        &mut self,
+        registry: &wl_registry::WlRegistry,
+        event: wl_registry::Event,
+        _: &(),
+        _: &Connection,
+        qh: &QueueHandle<Self>,
+    ) {
+        match event {
+            wl_registry::Event::Global { name, interface, version } => {
+                println!("Global: [{name}] {interface} v{version}");
+
+                if interface == "wl_compositor" {
+                    // Bind the compositor at version 5 (or lower if server advertises less)
+                    let compositor = registry.bind::<
+                        wayland_client::protocol::wl_compositor::WlCompositor, _, _
+                    >(name, 5, qh, ());
+                    // compositor is a WlCompositor proxy
+                    let _ = compositor;
+                }
+            }
+            wl_registry::Event::GlobalRemove { name } => {
+                println!("Global removed: {name}");
+                // clean up any objects bound from this global
+            }
+            _ => {}
+        }
+    }
+}
+
+fn main() {
+    let conn = Connection::connect_to_env().unwrap();
+    let mut event_queue = conn.new_event_queue::<AppState>();
+    let qh = event_queue.handle();
+
+    conn.display().get_registry(&qh, ());
+
+    let mut state = AppState { compositor_name: None };
+    event_queue.roundtrip(&mut state).unwrap();
+}
+```
+
+<Tip>
+The `version` argument to `wl_registry.bind` is the version you want, capped by what the server advertises. Passing a version higher than the server supports is a protocol error. The `GlobalList::bind()` helper (below) handles this automatically.
+</Tip>
+
+## `GlobalList` and `registry_queue_init`
+
+For the common startup pattern—enumerate all globals, bind the ones you need, then enter the main loop—`wayland-client` provides `registry_queue_init` in the `globals` module:
+
+```rust
+use wayland_client::{
+    Connection,
+    globals::registry_queue_init,
+};
+```
+
+`registry_queue_init` takes a `Connection` reference and returns a `(GlobalList, EventQueue<State>)` pair. Internally it:
+
+1. Creates a new `EventQueue`.
+2. Sends `wl_display.get_registry`.
+3. Performs a `Connection::roundtrip()` to collect the initial `wl_registry.global` flood into a `GlobalListContents` buffer.
+4. Returns the `GlobalList` (which owns the registry and the contents) plus the fresh event queue.
+
+### `Dispatch<WlRegistry, GlobalListContents>` requirement
+
+To use `registry_queue_init`, your state must implement `Dispatch<WlRegistry, GlobalListContents>`. This is the implementation that will be called for *dynamic* registry events (globals added or removed after the initial roundtrip):
+
+```rust
+use wayland_client::{
+    Connection, Dispatch, QueueHandle,
+    globals::GlobalListContents,
+    protocol::wl_registry,
+};
+
+struct State;
+
+impl Dispatch<wl_registry::WlRegistry, State> for GlobalListContents {
+    fn event(
+        &self,
+        state: &mut State,
+        _proxy: &wl_registry::WlRegistry,
+        event: wl_registry::Event,
+        _conn: &Connection,
+        _qhandle: &QueueHandle<State>,
+    ) {
+        // React to dynamic global changes here.
+        // The GlobalListContents is already updated before this is called.
+        match event {
+            wl_registry::Event::Global { name, interface, version } => {
+                println!("New global appeared: [{name}] {interface} v{version}");
+            }
+            wl_registry::Event::GlobalRemove { name } => {
+                println!("Global removed: {name}");
+            }
+            _ => {}
+        }
+    }
+}
+```
+
+### Complete `GlobalList` example
+
+```rust
+use wayland_client::{
+    Connection, Dispatch, QueueHandle,
+    globals::{registry_queue_init, GlobalListContents},
+    protocol::{wl_compositor, wl_registry, wl_shm},
+};
+
+struct State;
+
+// Required: dynamic registry event handler
+impl Dispatch<wl_registry::WlRegistry, State> for GlobalListContents {
+    fn event(
+        &self,
+        _state: &mut State,
+        _proxy: &wl_registry::WlRegistry,
+        _event: wl_registry::Event,
+        _conn: &Connection,
+        _qhandle: &QueueHandle<State>,
+    ) {
+        // Handle dynamic global changes if needed
+    }
+}
+
+// Required: handle events for objects we bind
+impl Dispatch<wl_compositor::WlCompositor, ()> for State {
+    fn event(
+        &mut self,
+        _proxy: &wl_compositor::WlCompositor,
+        _event: wl_compositor::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+        // wl_compositor has no events
+    }
+}
+
+impl Dispatch<wl_shm::WlShm, ()> for State {
+    fn event(
+        &mut self,
+        _proxy: &wl_shm::WlShm,
+        event: wl_shm::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+        // wl_shm.format events list supported pixel formats
+        if let wl_shm::Event::Format { format } = event {
+            println!("Supported format: {format:?}");
+        }
+    }
+}
+
+fn main() {
+    let conn = Connection::connect_to_env().unwrap();
+
+    // Enumerate globals and get a ready-to-use event queue
+    let (globals, mut event_queue) =
+        registry_queue_init::<State>(&conn).unwrap();
+    let qh = event_queue.handle();
+
+    // Inspect the full list without binding
+    globals.contents().with_list(|list| {
+        for g in list {
+            println!("[{}] {} v{}", g.name, g.interface, g.version);
+        }
+    });
+
+    // Bind wl_compositor, requesting versions 4–6
+    let compositor: wl_compositor::WlCompositor =
+        globals.bind(&qh, 4..=6, ()).unwrap();
+
+    // Bind wl_shm at version 1
+    let _shm: wl_shm::WlShm =
+        globals.bind(&qh, 1..=1, ()).unwrap();
+
+    let mut state = State;
+    // Dispatch to receive wl_shm.format events, etc.
+    event_queue.roundtrip(&mut state).unwrap();
+
+    let _ = compositor;
+}
+```
+
+## `GlobalList::bind()`
+
+```rust
+pub fn bind<I, State, U>(
+    &self,
+    qh: &QueueHandle<State>,
+    version: RangeInclusive<u32>,
+    udata: U,
+) -> Result<I, BindError>
+```
+
+The `version` range lets you express both a minimum and a maximum:
+
+- If the server's advertised version is **below** the range start, you get `BindError::UnsupportedVersion`. Your code can handle this gracefully (log a warning, disable a feature).
+- If the server's advertised version is **above** the range end, `bind` silently caps the bound version to the range end.
+- Requesting a maximum higher than the version compiled into the generated code is a **panic** (programmer error).
+
+```rust
+match globals.bind::<wl_compositor::WlCompositor, _, _>(&qh, 4..=6, ()) {
+    Ok(compositor) => { /* use compositor */ }
+    Err(BindError::NotPresent(name)) => {
+        eprintln!("Global '{name}' not advertised by compositor");
+    }
+    Err(BindError::UnsupportedVersion { interface, requested, available }) => {
+        eprintln!(
+            "{interface}: need v{requested}, compositor only has v{available}"
+        );
+    }
+}
+```
+
+### `BindError` variants
+
+| Variant | Meaning |
+|---------|---------|
+| `BindError::NotPresent(&'static str)` | No global with the requested interface name was found in the list. |
+| `BindError::UnsupportedVersion { interface, requested, available }` | The global exists but its advertised version is below the minimum you requested. |
+
+## `GlobalListContents`
+
+`GlobalListContents` is a `Mutex<Vec<Global>>` wrapper exposed through two methods:
+
+```rust
+// Zero-copy: pass a closure that receives &[Global]
+globals.contents().with_list(|list| {
+    for g in list {
+        println!("{}: {}", g.name, g.interface);
+    }
+});
+
+// Owned copy: allocates a Vec<Global>
+let snapshot: Vec<Global> = globals.contents().clone_list();
+```
+
+Each `Global` has three fields:
+- `name: u32` — the server-assigned numeric handle used in `bind` and `global_remove`.
+- `interface: String` — the protocol interface name, e.g. `"wl_compositor"`.
+- `version: u32` — the maximum version the compositor supports.
+
+## Waiting for the initial global list
+
+`registry_queue_init` performs a roundtrip internally, so by the time it returns the `GlobalListContents` already holds all currently advertised globals. You do **not** need to call `roundtrip` again just to enumerate globals:
+
+```rust
+let (globals, event_queue) = registry_queue_init::<State>(&conn).unwrap();
+
+// Safe to call immediately — the list is already populated
+globals.contents().with_list(|list| {
+    assert!(!list.is_empty(), "compositor advertised no globals");
+});
+```
+
+## Handling global removal
+
+Multi-instance globals—`wl_output` (monitors), `wl_seat` (input devices)—can be added and removed at any time. `GlobalListContents` automatically removes the entry when it receives `wl_registry.global_remove`, but you still need to clean up any proxies you bound from that global in your `Dispatch<WlRegistry, GlobalListContents>` handler:
+
+```rust
+impl Dispatch<wl_registry::WlRegistry, State> for GlobalListContents {
+    fn event(
+        &self,
+        state: &mut State,
+        _proxy: &wl_registry::WlRegistry,
+        event: wl_registry::Event,
+        _conn: &Connection,
+        _qhandle: &QueueHandle<State>,
+    ) {
+        if let wl_registry::Event::GlobalRemove { name } = event {
+            // Remove any bound object whose name matches
+            state.outputs.retain(|o| o.registry_name != name);
+        }
+    }
+}
+```
+
+<Warning>
+Do not use `GlobalList::bind()` for multi-instance globals like `wl_output` and `wl_seat`. `bind()` looks up globals by interface name and returns the first match, which is not reliable when multiple instances coexist. Handle those globals in your `Dispatch<WlRegistry, _>` implementation using the raw `registry.bind()` call, keyed on the numeric `name`.
+</Warning>
+
+## Destroying the registry
+
+`GlobalList::destroy()` attempts to destroy the underlying `WlRegistry` object using the `wl_fixes` protocol extension (available on compositors that support it). This frees server-side resources and stops dynamic registry events from being delivered:
+
+```rust
+// globals is consumed; no further registry events will arrive
+globals.destroy();
+```
+
+If the compositor does not support `wl_fixes`, the call is a no-op—the registry object remains alive for the lifetime of the connection.

@@ -1,0 +1,367 @@
+---
+title: "wayland-backend low-level API reference"
+sidebarTitle: "wayland-backend"
+description: "Reference for wayland-backend 0.3: the low-level client and server protocol backends, ObjectData trait, and two backend implementations (rs and sys)."
+---
+
+`wayland-backend` is the foundational crate of the wayland-rs ecosystem. It provides low-level, unsafe-free APIs for driving both client and server sides of the Wayland protocol. Two interchangeable backend implementations are available: a pure-Rust backend (`rs`) and a system backend (`sys`) that delegates to the system-installed `libwayland` shared libraries. Higher-level crates such as `wayland-client` and `wayland-server` are built directly on top of this crate.
+
+<Note>
+Version covered by this reference: **0.3.15**. Full API documentation is available at [docs.rs/wayland-backend](https://docs.rs/wayland-backend/).
+</Note>
+
+## Installation and features
+
+Add `wayland-backend` to your `Cargo.toml`. By default only the pure-Rust backend is compiled; opt into the system backend by enabling the feature flags below.
+
+```toml
+[dependencies]
+wayland-backend = "0.3.15"
+```
+
+The following cargo features are available:
+
+| Feature | Description |
+|---|---|
+| `client_system` | Enable the system (`libwayland-client`) client backend. Enables the `sys::client` module. |
+| `server_system` | Enable the system (`libwayland-server`) server backend. Enables the `sys::server` module. |
+| `dlopen` | Load the wayland system libraries at runtime via `dlopen` instead of linking them at build time. Allows graceful fallback to X11 if the libraries are absent. |
+| `libwayland_client_1_23` | Unlocks API available only in libwayland-client ≥ 1.23 (e.g. `set_max_buffer_size`). |
+| `libwayland_server_1_22` | Unlocks API available only in libwayland-server ≥ 1.22 (e.g. `global_name`). |
+| `libwayland_server_1_23` | Unlocks API available only in libwayland-server ≥ 1.23 (implies `libwayland_server_1_22`). |
+| `rwh_06` | Implements [`HasDisplayHandle`](https://docs.rs/raw-window-handle/0.6/raw_window_handle/trait.HasDisplayHandle.html) from `raw-window-handle 0.6` on the client `Backend` (requires `client_system`). |
+| `log` | Route internal diagnostic messages through the `log` crate instead of printing to stderr. |
+
+<Tip>
+The `rwh_06` feature requires `client_system` to be active as well. Without `client_system` the `HasDisplayHandle` implementation is not generated.
+</Tip>
+
+## Module layout
+
+```
+wayland_backend
+├── rs             // Pure-Rust backend
+│   ├── client     // Client-side rs implementation
+│   └── server     // Server-side rs implementation
+├── sys            // System (libwayland) backend (feature-gated)
+│   ├── client     // Client-side sys implementation
+│   └── server     // Server-side sys implementation
+├── client         // Re-export: sys::client if client_system, else rs::client
+├── server         // Re-export: sys::server if server_system, else rs::server
+└── protocol       // Shared protocol types (Message, Interface, Argument, …)
+```
+
+The recommended usage is to import from `wayland_backend::client` and `wayland_backend::server` — these re-exports automatically select the appropriate backend based on enabled features, so your code remains correct regardless of whether another crate in the dependency tree enables `*_system`.
+
+## Client backend API
+
+All types below live in `wayland_backend::client` (re-exported from either `rs::client` or `sys::client`).
+
+### `Backend`
+
+The main entry point for client-side Wayland communication. Cloneable — all clones share the same underlying connection.
+
+```rust
+pub struct Backend { /* private */ }
+```
+
+| Method | Signature | Description |
+|---|---|---|
+| `connect` | `fn connect(stream: UnixStream) -> Result<Self, NoWaylandLib>` | Connect to a Wayland server over an established Unix socket. |
+| `downgrade` | `fn downgrade(&self) -> WeakBackend` | Create a weak reference to this backend. |
+| `flush` | `fn flush(&self) -> Result<(), WaylandError>` | Flush all pending outgoing requests to the server. |
+| `poll_fd` | `fn poll_fd(&self) -> BorrowedFd<'_>` | Borrow the socket FD for use with epoll/kqueue. |
+| `display_id` | `fn display_id(&self) -> ObjectId` | Get the `ObjectId` of the `wl_display` object. |
+| `last_error` | `fn last_error(&self) -> Option<WaylandError>` | Return the last connection error (connection is dead if `Some`). |
+| `info` | `fn info(&self, id: ObjectId) -> Result<ObjectInfo, InvalidId>` | Query protocol-level information about an object. |
+| `destroy_object` | `fn destroy_object(&self, id: &ObjectId) -> Result<(), InvalidId>` | Destroy a Wayland object without a destructor request. |
+| `send_request` | `fn send_request(&self, msg: Message<ObjectId, BorrowedFd>, data: Option<Arc<dyn ObjectData>>, child_spec: Option<(&'static Interface, u32)>) -> Result<ObjectId, InvalidId>` | Send a request to the server. |
+| `get_data` | `fn get_data(&self, id: ObjectId) -> Result<Arc<dyn ObjectData>, InvalidId>` | Retrieve the `ObjectData` associated with an object. |
+| `set_data` | `fn set_data(&self, id: ObjectId, data: Arc<dyn ObjectData>) -> Result<(), InvalidId>` | Replace the `ObjectData` associated with an object. |
+| `prepare_read` | `fn prepare_read(&self) -> Option<ReadEventsGuard>` | Begin the read-event sequence (see `ReadEventsGuard`). |
+| `dispatch_inner_queue` | `fn dispatch_inner_queue(&self) -> Result<usize, WaylandError>` | Dispatch the backend's internal queue (relevant for system backend multi-threading). |
+| `set_max_buffer_size` | `fn set_max_buffer_size(&self, max_buffer_size: Option<usize>)` | *(libwayland_client_1_23 feature)* Set the maximum connection buffer size. |
+
+### `ObjectId`
+
+A stable, versioned identifier for a Wayland protocol object. Implements `Clone`, `PartialEq`, `Eq`, `Hash`, `Display`, and `Debug`.
+
+```rust
+pub struct ObjectId { /* private */ }
+
+impl ObjectId {
+    pub fn is_null(&self) -> bool;
+    pub fn null() -> ObjectId;
+    pub fn interface(&self) -> &'static Interface;
+    pub fn protocol_id(&self) -> u32;
+}
+```
+
+<Warning>
+`protocol_id()` returns the raw wire ID, which the protocol reuses after object destruction. Do not use it as a unique identifier. Compare `ObjectId` values directly — they implement `PartialEq` correctly across reuse cycles.
+</Warning>
+
+### `ObjectData` trait
+
+Implement this trait to receive events for objects you create. Every object managed by the backend must have an `Arc<dyn ObjectData>` associated with it.
+
+```rust
+pub trait ObjectData: Any + Send + Sync {
+    fn event(
+        self: Arc<Self>,
+        backend: &Backend,
+        msg: Message<ObjectId, OwnedFd>,
+    ) -> Option<Arc<dyn ObjectData>>;
+
+    fn destroyed(&self, object_id: ObjectId);
+
+    // Optional — defaults to "ObjectData { ... }"
+    fn debug(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result;
+
+    // Optional — used to back Proxy::data() in wayland-client
+    fn data_as_any(&self) -> &dyn Any;
+}
+```
+
+| Method | Called when | Return value |
+|---|---|---|
+| `event` | An event is received for this object | `Some(Arc<dyn ObjectData>)` if the event created a new object; `None` otherwise |
+| `destroyed` | The object is destroyed (protocol destructor or explicit destroy) | — |
+
+### `WeakBackend`
+
+A non-owning handle to a `Backend`. Useful for storing inside `ObjectData` implementations to avoid reference cycles.
+
+```rust
+pub struct WeakBackend { /* private */ }
+
+impl WeakBackend {
+    pub fn upgrade(&self) -> Option<Backend>;
+}
+```
+
+### `ReadEventsGuard`
+
+Coordinates multi-threaded event reading. Create with `Backend::prepare_read()`, then poll the FD, then call `read()`.
+
+```rust
+pub struct ReadEventsGuard { /* private */ }
+
+impl ReadEventsGuard {
+    pub fn connection_fd(&self) -> BorrowedFd<'_>;
+    pub fn read(self) -> Result<usize, WaylandError>;
+}
+```
+
+Dropping the guard cancels the prepared read. If `prepare_read()` returns `None`, call `Backend::dispatch_inner_queue()` instead.
+
+### Error types
+
+| Type | Description |
+|---|---|
+| `InvalidId` | Returned when an `ObjectId` is no longer valid. |
+| `NoWaylandLib` | Returned by `Backend::connect` when `libwayland-client.so` cannot be loaded (only possible with the `dlopen` feature). |
+| `WaylandError` | An IO error or protocol error on the connection. Variants: `Io(std::io::Error)` and `Protocol(ProtocolError)`. |
+
+## Server backend API
+
+All types below live in `wayland_backend::server` (re-exported from either `rs::server` or `sys::server`).
+
+### `Backend<D>`
+
+The server-side backend. Parameterized by your application state type `D`, which is threaded through all callbacks.
+
+```rust
+pub struct Backend<D: 'static> { /* private */ }
+
+impl<D> Backend<D> {
+    pub fn new() -> Result<Self, InitError>;
+    pub fn handle(&self) -> Handle;
+    pub fn flush(&self, client: Option<ClientId>) -> std::io::Result<()>;
+    pub fn poll_fd(&self) -> BorrowedFd<'_>;
+    pub fn dispatch_single_client(&self, data: &mut D, client_id: ClientId) -> std::io::Result<usize>;
+    pub fn dispatch_all_clients(&self, data: &mut D) -> std::io::Result<usize>;
+}
+```
+
+### `Handle`
+
+The primary interface for manipulating server-side Wayland state. Cloneable. Provided as an argument to most callbacks.
+
+```rust
+pub struct Handle { /* private */ }
+```
+
+| Method | Signature | Description |
+|---|---|---|
+| `downgrade` | `fn downgrade(&self) -> WeakHandle` | Create a weak reference. |
+| `insert_client` | `fn insert_client(&self, stream: UnixStream, data: Arc<dyn ClientData>) -> std::io::Result<ClientId>` | Accept a new client connection. |
+| `get_client` | `fn get_client(&self, id: ObjectId) -> Result<ClientId, InvalidId>` | Get the owning client of an object. |
+| `get_client_data` | `fn get_client_data(&self, id: ClientId) -> Result<Arc<dyn ClientData>, InvalidId>` | Get data associated with a client. |
+| `get_client_credentials` | `fn get_client_credentials(&self, id: ClientId) -> Result<Credentials, InvalidId>` | Get the PID/UID/GID of a client. |
+| `with_all_clients` | `fn with_all_clients(&self, f: impl FnMut(ClientId))` | Iterate all connected clients. |
+| `create_object<D>` | `fn create_object<D: 'static>(&self, client_id: ClientId, interface: &'static Interface, version: u32, data: Arc<dyn ObjectData<D>>) -> Result<ObjectId, InvalidId>` | Create a new protocol object for a client. |
+| `destroy_object<D>` | `fn destroy_object<D: 'static>(&self, id: &ObjectId) -> Result<(), InvalidId>` | Destroy a protocol object. |
+| `send_event` | `fn send_event(&self, msg: Message<ObjectId, BorrowedFd>) -> Result<(), InvalidId>` | Send an event to a client. |
+| `get_object_data<D>` | `fn get_object_data<D: 'static>(&self, id: ObjectId) -> Result<Arc<dyn ObjectData<D>>, InvalidId>` | Retrieve object data. |
+| `set_object_data<D>` | `fn set_object_data<D: 'static>(&self, id: ObjectId, data: Arc<dyn ObjectData<D>>) -> Result<(), InvalidId>` | Replace object data. |
+| `post_error` | `fn post_error(&self, object_id: ObjectId, error_code: u32, message: CString)` | Send a protocol error and disconnect the client. |
+| `kill_client` | `fn kill_client(&self, client_id: ClientId, reason: DisconnectReason)` | Forcefully disconnect a client. |
+| `create_global<D>` | `fn create_global<D: 'static>(&self, interface: &'static Interface, version: u32, handler: Arc<dyn GlobalHandler<D>>) -> GlobalId` | Advertise a new global to clients. |
+| `disable_global<D>` | `fn disable_global<D: 'static>(&self, id: GlobalId)` | Stop advertising a global without freeing it. |
+| `remove_global<D>` | `fn remove_global<D: 'static>(&self, id: GlobalId)` | Remove and free a global. |
+| `global_info` | `fn global_info(&self, id: GlobalId) -> Result<GlobalInfo, InvalidId>` | Query info about a global. |
+| `flush` | `fn flush(&self, client: Option<ClientId>) -> std::io::Result<()>` | Flush pending events (all clients if `None`). |
+
+### `ObjectData<D>` trait (server)
+
+```rust
+pub trait ObjectData<D>: Any + Send + Sync {
+    fn request(
+        self: Arc<Self>,
+        handle: &Handle,
+        data: &mut D,
+        client_id: ClientId,
+        msg: Message<ObjectId, OwnedFd>,
+    ) -> Option<Arc<dyn ObjectData<D>>>;
+
+    fn destroyed(
+        self: Arc<Self>,
+        handle: &Handle,
+        data: &mut D,
+        client_id: ClientId,
+        object_id: ObjectId,
+    );
+
+    fn debug(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result;
+}
+```
+
+### `GlobalHandler<D>` trait
+
+```rust
+pub trait GlobalHandler<D>: Any + Send + Sync {
+    // Returns true by default — override to implement access control
+    fn can_view(
+        &self,
+        client_id: ClientId,
+        client_data: &Arc<dyn ClientData>,
+        global_id: GlobalId,
+    ) -> bool;
+
+    fn bind(
+        self: Arc<Self>,
+        handle: &Handle,
+        data: &mut D,
+        client_id: ClientId,
+        global_id: GlobalId,
+        object_id: ObjectId,
+    ) -> Arc<dyn ObjectData<D>>;
+}
+```
+
+### `ClientData` trait
+
+```rust
+pub trait ClientData: Any + Send + Sync {
+    fn initialized(&self, client_id: ClientId) {}
+    fn disconnected(&self, client_id: ClientId, reason: DisconnectReason) {}
+}
+```
+
+### Server ID and error types
+
+| Type | Description |
+|---|---|
+| `ClientId` | Stable identifier for a connected client. Implements `Clone`, `PartialEq`, `Eq`, `Hash`. |
+| `ObjectId` | Stable identifier for a server-side protocol object. |
+| `GlobalId` | Identifier for an advertised global. |
+| `InvalidId` | Returned when an ID is no longer valid. |
+| `InitError` | Returned by `Backend::new()`. Variants: `NoWaylandLib` and `Io(std::io::Error)`. |
+| `DisconnectReason` | Passed to `ClientData::disconnected`. Variants: `ConnectionClosed` and `ProtocolError(ProtocolError)`. |
+| `Credentials` | Holds `pid: RawPid`, `uid: RawUid`, `gid: RawGid` of a connected client. |
+
+## Protocol types
+
+All types live in `wayland_backend::protocol`.
+
+### `Message<Id, Fd>`
+
+Represents a single Wayland wire message (either a request or an event).
+
+```rust
+pub struct Message<Id, Fd> {
+    pub sender_id: Id,
+    pub opcode: u16,
+    pub args: SmallVec<[Argument<Id, Fd>; 4]>,
+}
+
+impl<Id, Fd> Message<Id, Fd> {
+    pub fn map_fd<T>(self, f: impl FnMut(Fd) -> T) -> Message<Id, T>;
+}
+```
+
+### `Argument<Id, Fd>`
+
+An enum covering all Wayland wire argument types.
+
+```rust
+pub enum Argument<Id, Fd> {
+    Int(i32),
+    Uint(u32),
+    Fixed(i32),       // 1/256 precision fixed-point
+    Str(Option<Box<CString>>),
+    Object(Id),
+    NewId(Id),
+    Array(Box<Vec<u8>>),
+    Fd(Fd),
+}
+```
+
+### `Interface`
+
+Static metadata for a Wayland interface.
+
+```rust
+pub struct Interface {
+    pub name: &'static str,
+    pub version: u32,
+    pub requests: &'static [MessageDesc],
+    pub events: &'static [MessageDesc],
+    pub c_interface: Option<&'static CWlInterface>,
+}
+```
+
+## The `message!` macro
+
+`wayland_backend::message!` is a convenience macro for constructing `Message` values without manually building a `SmallVec`.
+
+```rust
+use wayland_backend::{message, protocol::{Message, Argument}};
+
+let msg: Message<ObjectId, _> = message!(
+    display_id,   // sender_id: ObjectId
+    0,            // opcode: u16
+    [Argument::Uint(1)],
+);
+```
+
+The macro signature:
+
+```rust
+macro_rules! message {
+    ($sender_id:expr, $opcode:expr, [$($args:expr),* $(,)?] $(,)?) => { ... }
+}
+```
+
+## Logging
+
+By default, runtime error messages (such as protocol errors) are printed to stderr. Enable the `log` feature to route them through the [`log`](https://docs.rs/log) crate instead:
+
+```toml
+[dependencies]
+wayland-backend = { version = "0.3.15", features = ["log"] }
+log = "0.4"
+```
+
+With `log` enabled, messages are emitted at the `error` level via `log::error!`. This allows integration with any logging framework that implements the `log` facade (e.g. `env_logger`, `tracing-log`).

@@ -1,0 +1,569 @@
+---
+title: "wayland-client API reference"
+sidebarTitle: "wayland-client"
+description: "Complete API reference for wayland-client 0.31: Connection, EventQueue, Dispatch, QueueHandle, Proxy, and the globals module."
+---
+
+The `wayland-client` crate provides Rust bindings for the Wayland protocol on the client side. It is structured around four central concepts: the [`Connection`](#connection) that manages your socket to the compositor, [`EventQueue<D>`](#eventqueue) that dispatches protocol events to your state, proxies implementing the [`Proxy`](#the-proxy-trait) trait that represent Wayland objects, and the [`Dispatch`](#dispatch) trait that ties event handling logic to your state type.
+
+<Tip>
+  Full rustdoc documentation is available at [docs.rs/wayland-client](https://docs.rs/wayland-client/).
+</Tip>
+
+## Installation
+
+Add `wayland-client` to your `Cargo.toml`:
+
+```toml
+[dependencies]
+wayland-client = "0.31"
+```
+
+### Feature flags
+
+| Feature | Description |
+|---|---|
+| `system` | Link against the system-installed `libwayland-client.so` rather than using the built-in pure-Rust backend. Required for FFI interop (e.g. `raw-window-handle`). |
+| `dlopen` | Load `libwayland-client.so` at runtime via `dlopen` instead of linking it at build time. Implies `system`. |
+| `libwayland_1_23` | Enable APIs that require libwayland ≥ 1.23 (e.g. `Connection::set_max_buffer_size`). |
+
+Example with features:
+
+```toml
+[dependencies]
+wayland-client = { version = "0.31", features = ["system"] }
+```
+
+---
+
+## Core types reference
+
+### `Connection`
+
+`Connection` is the entry point for any Wayland client application. It represents your connection to the Wayland compositor and is the source from which all other objects are created.
+
+```rust
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Connection { /* private */ }
+```
+
+#### Constructors
+
+| Method | Signature | Description |
+|---|---|---|
+| `connect_to_env` | `() -> Result<Self, ConnectError>` | Connect to the compositor using the standard environment variables (`WAYLAND_SOCKET` or `WAYLAND_DISPLAY` + `XDG_RUNTIME_DIR`). This is the standard way to initialize a connection. |
+| `from_socket` | `(stream: UnixStream) -> Result<Self, ConnectError>` | Initialize a connection from an already existing Unix socket stream. |
+| `from_backend` | `(backend: Backend) -> Self` | Wrap an existing `wayland-backend` `Backend` into a `Connection`. Useful when plugging into an external Wayland connection. |
+
+#### Instance methods
+
+| Method | Signature | Description |
+|---|---|---|
+| `display` | `(&self) -> WlDisplay` | Retrieve the `wl_display` object. This is the root Wayland object, from which everything else is derived. |
+| `new_event_queue` | `<State>(&self) -> EventQueue<State>` | Create a new `EventQueue` associated with this connection. |
+| `backend` | `(&self) -> Backend` | Access the underlying `wayland-backend` `Backend`. |
+| `flush` | `(&self) -> Result<(), WaylandError>` | Flush all pending outgoing requests to the server. Many dispatch methods call this implicitly. |
+| `prepare_read` | `(&self) -> Option<ReadEventsGuard>` | Begin a synchronized read from the socket. Returns a guard that must be used to perform the actual read. Returns `None` if events are already pending in an internal queue. |
+| `roundtrip` | `(&self) -> Result<usize, WaylandError>` | Block until the server has processed all requests sent so far. Useful during app initialization. Returns the number of events dispatched. |
+| `protocol_error` | `(&self) -> Option<ProtocolError>` | Returns the protocol error that terminated the connection, if any. |
+| `send_request` | `<I: Proxy>(&self, proxy: &I, request: I::Request<'_>, data: Option<Arc<dyn ObjectData>>) -> Result<ObjectId, InvalidId>` | Low-level request sender used by scanner-generated code. Prefer [`Proxy::send_request()`](#the-proxy-trait) instead. |
+| `object_info` | `(&self, id: ObjectId) -> Result<ObjectInfo, InvalidId>` | Retrieve protocol information (interface, version) for a given object ID. |
+| `get_object_data` | `(&self, id: ObjectId) -> Result<Arc<dyn ObjectData>, InvalidId>` | Retrieve the raw object data for an object. Prefer [`Proxy::data()`](#the-proxy-trait). |
+| `set_max_buffer_size` | `(&self, max_buffer_size: Option<usize>)` | Set the maximum send buffer size. Requires the `libwayland_1_23` feature. |
+
+`Connection` also implements `AsFd`, providing the underlying poll file descriptor for integration with `epoll` or similar.
+
+**Quick-start example:**
+
+```rust
+use wayland_client::Connection;
+
+let conn = Connection::connect_to_env().unwrap();
+let display = conn.display();
+let mut event_queue = conn.new_event_queue::<MyState>();
+let qh = event_queue.handle();
+let _registry = display.get_registry(&qh, ());
+event_queue.roundtrip(&mut MyState).unwrap();
+```
+
+---
+
+### `ConnectError`
+
+Returned by `Connection::connect_to_env()` and `Connection::from_socket()` when the connection cannot be established.
+
+```rust
+#[derive(Debug)]
+pub enum ConnectError {
+    NoWaylandLib,
+    NoCompositor,
+    InvalidFd,
+}
+```
+
+| Variant | Description |
+|---|---|
+| `NoWaylandLib` | The Wayland library could not be loaded (only relevant when the `dlopen` feature is enabled). |
+| `NoCompositor` | No Wayland compositor was found. Either `WAYLAND_DISPLAY` is unset, `XDG_RUNTIME_DIR` is not absolute, or the socket does not exist. |
+| `InvalidFd` | `WAYLAND_SOCKET` was set but contained a value that could not be parsed as a valid file descriptor. |
+
+---
+
+### `EventQueue<D>`
+
+`EventQueue<D>` orchestrates event dispatching. Events read from the socket are buffered internally and then delivered one by one to the `Dispatch` implementations on your `D` state struct.
+
+```rust
+pub struct EventQueue<State> { /* private */ }
+```
+
+<Note>
+  `EventQueue` implements `AsFd`, so it can be used directly as a file-descriptor source in event loops such as `calloop` (via the `calloop-wayland-source` crate).
+</Note>
+
+#### Methods
+
+| Method | Signature | Description |
+|---|---|---|
+| `handle` | `(&self) -> QueueHandle<State>` | Return a cloneable `QueueHandle` for this queue, used to assign new objects to it. |
+| `dispatch_pending` | `(&mut self, data: &mut State) -> Result<usize, DispatchError>` | Dispatch all currently buffered events without blocking. Returns the number of events dispatched. |
+| `blocking_dispatch` | `(&mut self, data: &mut State) -> Result<usize, DispatchError>` | Flush the connection, then block until at least one event arrives and dispatch all pending events. The simplest main-loop primitive. |
+| `roundtrip` | `(&mut self, data: &mut State) -> Result<usize, DispatchError>` | Send a `wl_display.sync` request and block until the server acknowledges it, dispatching all events along the way. Useful for setup. |
+| `flush` | `(&self) -> Result<(), WaylandError>` | Flush outgoing requests without reading. Equivalent to `Connection::flush()`. |
+| `prepare_read` | `(&self) -> Option<ReadEventsGuard>` | Prepare for a manual read. Returns `None` if events are already pending. |
+| `poll_dispatch_pending` | `(&mut self, cx: &mut task::Context, data: &mut State) -> task::Poll<Result<Infallible, DispatchError>>` | Async-friendly dispatch: registers the current task for wakeup when new events arrive. |
+
+**Single-queue main loop:**
+
+```rust
+while !state.should_exit {
+    event_queue.blocking_dispatch(&mut state).unwrap();
+}
+```
+
+**Integration with epoll / custom event loops:**
+
+```rust
+loop {
+    event_queue.flush().unwrap();
+    event_queue.dispatch_pending(&mut state).unwrap();
+
+    let read_guard = event_queue.prepare_read().unwrap();
+    // ... wait on epoll for read_guard.connection_fd() ...
+    if wayland_socket_ready {
+        read_guard.read().unwrap();
+        event_queue.dispatch_pending(&mut state).unwrap();
+    } else {
+        drop(read_guard);
+    }
+}
+```
+
+---
+
+### `QueueHandle<D>`
+
+A lightweight, cloneable handle to an `EventQueue`. You pass this handle when creating Wayland objects so that their events are routed to the correct queue.
+
+```rust
+pub struct QueueHandle<State> { /* private */ }
+```
+
+`QueueHandle` is `Clone + Debug + Send + Sync`.
+
+#### Methods
+
+| Method | Signature | Description |
+|---|---|---|
+| `make_data` | `<I: Proxy + 'static, U>(&self, user_data: U) -> Arc<dyn ObjectData>` where `U: Dispatch<I, State> + Send + Sync + 'static` | Create a backend `ObjectData` that forwards events through this queue's `Dispatch` machinery. Used internally by scanner-generated code. |
+| `freeze` | `(&self) -> QueueFreezeGuard<'_, State>` | Temporarily suspend event processing on this queue. Processing resumes when the returned guard is dropped. |
+
+---
+
+### `QueueFreezeGuard`
+
+A RAII guard returned by `QueueHandle::freeze()`. While this guard is alive, dispatching on the associated queue will block until all guards are dropped.
+
+```rust
+#[derive(Debug)]
+pub struct QueueFreezeGuard<'a, State> { /* private */ }
+```
+
+Drop the guard to resume normal dispatch.
+
+---
+
+### `Dispatch<I, State>`
+
+The `Dispatch` trait is the central event-handling abstraction. Your state type must implement `Dispatch<I, UserData, State>` for every Wayland interface `I` whose events you want to process.
+
+```rust
+pub trait Dispatch<I, State>
+where
+    I: Proxy,
+{
+    fn event(
+        &self,
+        state: &mut State,
+        proxy: &I,
+        event: I::Event,
+        conn: &Connection,
+        qhandle: &QueueHandle<State>,
+    );
+
+    fn event_created_child(opcode: u16, qhandle: &QueueHandle<State>) -> Arc<dyn ObjectData> {
+        /* default: panics */
+    }
+}
+```
+
+<Note>
+  `Dispatch` is implemented on the **user-data type** (second type parameter), not directly on the state. This allows multiple implementations for the same interface with different user-data types, and makes generic delegation straightforward.
+</Note>
+
+**Parameters passed to `event()`:**
+
+| Parameter | Type | Description |
+|---|---|---|
+| `&self` | `&UserData` | The user-data value associated with the specific object that received the event. |
+| `state` | `&mut State` | Mutable reference to your application state. |
+| `proxy` | `&I` | The Wayland proxy object that received the event. |
+| `event` | `I::Event` | The event enum variant, carrying all event arguments. |
+| `conn` | `&Connection` | The active connection, in case you need to send additional requests. |
+| `qhandle` | `&QueueHandle<State>` | A handle to the current event queue, for creating new objects. |
+
+**Implementing `Dispatch` for `wl_registry`:**
+
+```rust
+use wayland_client::{protocol::wl_registry, Connection, Dispatch, QueueHandle};
+
+struct AppState;
+
+impl Dispatch<wl_registry::WlRegistry, AppState> for () {
+    fn event(
+        &self,
+        _state: &mut AppState,
+        _registry: &wl_registry::WlRegistry,
+        event: wl_registry::Event,
+        _conn: &Connection,
+        _qh: &QueueHandle<AppState>,
+    ) {
+        if let wl_registry::Event::Global { name, interface, version } = event {
+            println!("[{}] {} (v{})", name, interface, version);
+        }
+    }
+}
+```
+
+**Generic (delegate) implementation pattern:**
+
+```rust
+impl<State> Dispatch<wl_registry::WlRegistry, State> for MyUserData
+where
+    State: Dispatch<wl_registry::WlRegistry, MyUserData>,
+    State: AsMut<MyDelegate>,
+{
+    fn event(
+        &self,
+        state: &mut State,
+        _proxy: &wl_registry::WlRegistry,
+        _event: wl_registry::Event,
+        _conn: &Connection,
+        _qh: &QueueHandle<State>,
+    ) {
+        let delegate: &mut MyDelegate = state.as_mut();
+        // handle event with delegate...
+    }
+}
+```
+
+---
+
+### `Noop` and `NoopIgnore`
+
+Two convenience types that provide blanket `Dispatch` implementations:
+
+```rust
+#[derive(Debug)]
+pub struct Noop;
+
+impl<I: Proxy, State> Dispatch<I, State> for Noop {
+    fn event(&self, _: &mut State, _: &I, _: I::Event, _: &Connection, _: &QueueHandle<State>) {
+        unreachable!()
+    }
+}
+
+#[derive(Debug)]
+pub struct NoopIgnore;
+
+impl<I: Proxy, State> Dispatch<I, State> for NoopIgnore {
+    fn event(&self, _: &mut State, _: &I, _: I::Event, _: &Connection, _: &QueueHandle<State>) {}
+}
+```
+
+| Type | Behavior |
+|---|---|
+| `Noop` | Panics (`unreachable!()`) if any event is dispatched. Useful to assert that a particular object should never receive events in your app. |
+| `NoopIgnore` | Silently drops all events. Useful as a placeholder for objects whose events you intentionally ignore. |
+
+---
+
+### `DispatchError`
+
+Returned by dispatch methods when a protocol message cannot be decoded.
+
+```rust
+#[derive(Debug)]
+pub enum DispatchError {
+    BadMessage {
+        sender_id: ObjectId,
+        interface: &'static str,
+        opcode: u16,
+    },
+    Backend(WaylandError),
+}
+```
+
+| Variant | Description |
+|---|---|
+| `BadMessage { sender_id, interface, opcode }` | The received message does not match the interface specification for the target object. |
+| `Backend(WaylandError)` | An error propagated from the `wayland-backend` layer (e.g., an I/O error). |
+
+---
+
+## The `Proxy` trait
+
+Every Wayland object on the client side is represented by a type that implements `Proxy`. These types are code-generated from Wayland XML protocol specifications (e.g., `WlCompositor`, `WlSurface`, `XdgToplevel`).
+
+```rust
+pub trait Proxy: Clone + std::fmt::Debug + Sized + 'static {
+    type Event;
+    type Request<'a>;
+
+    fn interface() -> &'static Interface;
+    fn id(&self) -> ObjectId;
+    fn version(&self) -> u32;
+    fn is_alive(&self) -> bool;
+    fn data<U: Send + Sync + 'static>(&self) -> Option<&U>;
+    fn object_data(&self) -> Option<&Arc<dyn ObjectData>>;
+    fn backend(&self) -> &backend::WeakBackend;
+    fn from_id(conn: &Connection, id: ObjectId) -> Result<Self, InvalidId>;
+    fn inert(backend: backend::WeakBackend) -> Self;
+    fn send_request(&self, req: Self::Request<'_>) -> Result<(), InvalidId>;
+    fn send_constructor<I: Proxy>(
+        &self,
+        req: Self::Request<'_>,
+        data: Arc<dyn ObjectData>,
+    ) -> Result<I, InvalidId>;
+    fn parse_event(
+        conn: &Connection,
+        msg: Message<ObjectId, OwnedFd>,
+    ) -> Result<(Self, Self::Event), DispatchError>;
+    fn write_request<'a>(
+        &self,
+        conn: &Connection,
+        req: Self::Request<'a>,
+    ) -> Result<(Message<ObjectId, BorrowedFd<'a>>, Option<(&'static Interface, u32)>), InvalidId>;
+    fn downgrade(&self) -> Weak<Self>;
+}
+```
+
+#### Key method descriptions
+
+| Method | Description |
+|---|---|
+| `interface()` | Returns the static `Interface` descriptor (name, version, requests, events). |
+| `id()` | Returns the `ObjectId` identifying this object in the protocol stream. |
+| `version()` | Returns the negotiated version of this object. |
+| `is_alive()` | Returns `true` if the underlying Wayland object is still alive (not destroyed). |
+| `data::<U>()` | Downcast and retrieve the user-data of type `U` associated with this object. Returns `None` on type mismatch. |
+| `object_data()` | Access the raw `Arc<dyn ObjectData>`. Use `data()` for typed access. |
+| `backend()` | Access the weak reference to the backend. |
+| `from_id(conn, id)` | Reconstruct a proxy from a raw `ObjectId`. Errors if the ID doesn't match the interface. |
+| `send_request(req)` | Send a request that does not create a new object. |
+| `send_constructor(req, data)` | Send a request that creates a new object, providing `ObjectData` for it. |
+| `parse_event(conn, msg)` | Decode a raw protocol message into a typed `(proxy, event)` pair. Scanner-generated use. |
+| `write_request(conn, req)` | Encode a typed request into a raw `Message`. Scanner-generated use. |
+| `downgrade()` | Create a `Weak<Self>` handle that does not prevent user-data from being freed. |
+
+### `Weak<I>`
+
+```rust
+#[derive(Debug, Clone)]
+pub struct Weak<I> { /* private */ }
+```
+
+A weak reference to a Wayland object. Does not keep the object's user-data alive.
+
+| Method | Signature | Description |
+|---|---|---|
+| `upgrade` | `(&self) -> Result<I, InvalidId>` | Try to upgrade back to a full proxy. Fails if the object or connection is gone. |
+| `id` | `(&self) -> ObjectId` | Returns the underlying object ID. |
+
+`Weak<I>` implements `PartialEq`, `Eq`, `Hash`, and `PartialEq<I>`.
+
+---
+
+## The `globals` module
+
+The `wayland_client::globals` module provides high-level helpers for the common initialization pattern of enumerating the compositor's advertised globals from the `wl_registry`.
+
+### `registry_queue_init`
+
+```rust
+pub fn registry_queue_init<State>(
+    conn: &Connection,
+) -> Result<(GlobalList, EventQueue<State>), GlobalError>
+where
+    State: 'static,
+    GlobalListContents: Dispatch<wl_registry::WlRegistry, State> + 'static,
+```
+
+The primary entry point. Creates a new `EventQueue`, performs an initial roundtrip to collect all globals, and returns both the `GlobalList` and the event queue.
+
+<Note>
+  Your `State` must satisfy `GlobalListContents: Dispatch<WlRegistry, State>`. Implement `Dispatch<WlRegistry, State> for GlobalListContents` in your app to react to dynamic `global` / `global_remove` events after initialization.
+</Note>
+
+### `GlobalList`
+
+```rust
+#[derive(Debug)]
+pub struct GlobalList { /* private */ }
+```
+
+Holds the list of globals advertised by the compositor during the initial roundtrip.
+
+| Method | Signature | Description |
+|---|---|---|
+| `contents` | `(&self) -> &GlobalListContents` | Access the live list of globals. |
+| `bind` | `<I, State, U>(&self, qh: &QueueHandle<State>, version: RangeInclusive<u32>, udata: U) -> Result<I, BindError>` | Bind a global, returning the bound protocol object. The version bound is `min(server_version, *version.end())`. |
+| `registry` | `(&self) -> &wl_registry::WlRegistry` | Access the underlying `WlRegistry` object directly. |
+| `destroy` | `(self)` | Destroy the registry using `wl_fixes` if supported by the compositor. |
+
+**Usage example:**
+
+```rust
+use wayland_client::{
+    globals::{registry_queue_init, GlobalListContents},
+    protocol::{wl_compositor, wl_registry},
+    Connection, Dispatch, QueueHandle,
+};
+
+struct State;
+
+impl Dispatch<wl_registry::WlRegistry, State> for GlobalListContents {
+    fn event(
+        &self,
+        _state: &mut State,
+        _proxy: &wl_registry::WlRegistry,
+        _event: wl_registry::Event,
+        _conn: &Connection,
+        _qh: &QueueHandle<State>,
+    ) {
+        // handle dynamic global add/remove events
+    }
+}
+
+let conn = Connection::connect_to_env().unwrap();
+let (globals, queue) = registry_queue_init::<State>(&conn).unwrap();
+
+let compositor: wl_compositor::WlCompositor =
+    globals.bind(&queue.handle(), 4..=6, ()).unwrap();
+```
+
+### `GlobalListContents`
+
+```rust
+#[derive(Debug)]
+pub struct GlobalListContents { /* private */ }
+```
+
+A thread-safe container holding the current snapshot of advertised globals.
+
+| Method | Signature | Description |
+|---|---|---|
+| `with_list` | `<T, F: FnOnce(&[Global]) -> T>(&self, f: F) -> T` | Invoke a closure with a borrow of the global list. Avoids cloning. |
+| `clone_list` | `(&self) -> Vec<Global>` | Return a cloned copy of all globals. |
+
+### `Global`
+
+```rust
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Global {
+    pub name: u32,
+    pub interface: String,
+    pub version: u32,
+}
+```
+
+Represents a single advertised global.
+
+| Field | Type | Description |
+|---|---|---|
+| `name` | `u32` | The server-assigned numeric name used to bind the global. |
+| `interface` | `String` | The interface name string (e.g. `"wl_compositor"`). |
+| `version` | `u32` | The maximum version supported by the server. |
+
+### `BindError`
+
+```rust
+#[derive(Debug)]
+pub enum BindError {
+    UnsupportedVersion { interface: &'static str, requested: u32, available: u32 },
+    NotPresent(&'static str),
+}
+```
+
+| Variant | Description |
+|---|---|
+| `UnsupportedVersion { interface, requested, available }` | The server's advertised version is lower than the minimum version requested. |
+| `NotPresent(name)` | No global with the given interface name was found in the registry. |
+
+### `GlobalError`
+
+```rust
+#[derive(Debug)]
+pub enum GlobalError {
+    Backend(WaylandError),
+    InvalidId(InvalidId),
+}
+```
+
+Returned by `registry_queue_init` if initialization fails.
+
+---
+
+## The `backend` module
+
+The `wayland_client::backend` module re-exports low-level types from `wayland-backend` for use in advanced scenarios (FFI, custom `ObjectData` implementations).
+
+```rust
+pub mod backend {
+    pub use wayland_backend::client::{
+        Backend,
+        InvalidId,
+        NoWaylandLib,
+        ObjectData,
+        ObjectId,
+        ReadEventsGuard,
+        WaylandError,
+        WeakBackend,
+    };
+    pub use wayland_backend::protocol;
+    pub use wayland_backend::smallvec;
+}
+```
+
+| Re-export | Description |
+|---|---|
+| `Backend` | The raw backend holding the socket and protocol state. |
+| `InvalidId` | Error type indicating an object ID is no longer valid. |
+| `NoWaylandLib` | Error returned when the Wayland library cannot be found (`dlopen` feature). |
+| `ObjectData` | Trait for associating custom event callbacks directly with an object, bypassing `Dispatch`. |
+| `ObjectId` | Opaque identifier for a protocol object. Can be converted to/from a raw `*mut wl_proxy` pointer via `as_ptr()` / `from_ptr()` when the `system` feature is enabled. |
+| `ReadEventsGuard` | Guard returned by `prepare_read()`. Call `.read()` to read events from the socket. |
+| `WaylandError` | Combined error type wrapping I/O errors and protocol errors. |
+| `WeakBackend` | A weak reference to a `Backend`, used inside proxy types. |
+| `protocol` | Re-export of wayland-backend's protocol primitives (`Message`, `Interface`, etc.). |
+| `smallvec` | Re-export of `smallvec` used internally for argument lists. |

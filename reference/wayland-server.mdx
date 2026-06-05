@@ -1,0 +1,475 @@
+---
+title: "wayland-server API reference"
+sidebarTitle: "wayland-server"
+description: "Complete API reference for wayland-server 0.31: Display, DisplayHandle, Resource, GlobalDispatch, Dispatch, Client, and ListeningSocket."
+---
+
+The `wayland-server` crate provides Rust bindings for implementing Wayland compositors. It is structured around four central abstractions: the [`Display<D>`](#display) that drives protocol processing for all connected clients, the [`DisplayHandle`](#displayhandle) through which you interact with the protocol state, resources implementing the [`Resource`](#the-resource-trait) trait that represent Wayland objects owned by clients, and the [`Dispatch`](#dispatch) / [`GlobalDispatch`](#globaldispatch) traits that connect protocol events to your compositor state.
+
+<Tip>
+  Full rustdoc documentation is available at [docs.rs/wayland-server](https://docs.rs/wayland-server/).
+</Tip>
+
+## Installation
+
+Add `wayland-server` to your `Cargo.toml`:
+
+```toml
+[dependencies]
+wayland-server = "0.31"
+```
+
+### Feature flags
+
+| Feature | Description |
+|---|---|
+| `system` | Link against the system-installed `libwayland-server.so` rather than using the built-in pure-Rust backend. Required for FFI interop (e.g. sharing a `wl_display*` with the graphics stack). |
+| `dlopen` | Load `libwayland-server.so` at runtime via `dlopen` instead of linking it at build time. Implies `system`. |
+| `libwayland_1_22` | Enable APIs that require libwayland ≥ 1.22 (e.g. `Client::global_name`). |
+| `libwayland_1_23` | Enable APIs that require libwayland ≥ 1.23 (e.g. `DisplayHandle::set_default_max_buffer_size`, `Client::set_max_buffer_size`). Implies `libwayland_1_22`. |
+
+```toml
+[dependencies]
+wayland-server = { version = "0.31", features = ["system"] }
+```
+
+---
+
+## Core types reference
+
+### `Display<D>`
+
+`Display<D>` is the heart of your Wayland compositor. It owns the backend protocol state and drives all client request processing. The `D` type parameter is your global compositor state.
+
+```rust
+#[derive(Debug)]
+pub struct Display<State: 'static> { /* private */ }
+```
+
+`Display` implements `AsFd`, giving you the poll file descriptor to integrate with `epoll` or similar mechanisms.
+
+#### Constructors
+
+| Method | Signature | Description |
+|---|---|---|
+| `new` | `() -> Result<Display<State>, InitError>` | Create a new Wayland display. Fails only if the `system` + `dlopen` features are both enabled and `libwayland-server.so` cannot be found. |
+
+#### Instance methods
+
+| Method | Signature | Description |
+|---|---|---|
+| `handle` | `(&self) -> DisplayHandle` | Retrieve a `DisplayHandle` for protocol interactions. This is the clonable type you pass around to interact with the Wayland state. |
+| `dispatch_clients` | `(&mut self, state: &mut State) -> std::io::Result<usize>` | Read and dispatch all pending requests from all connected clients. Invokes `Dispatch::request()` for each request. Call this whenever the poll fd becomes readable. |
+| `flush_clients` | `(&mut self) -> std::io::Result<()>` | Write all pending outgoing events into client sockets. Call this regularly, typically after dispatching. |
+| `backend` | `(&mut self) -> &mut Backend<State>` | Access the underlying `wayland-backend` `Backend` for advanced use. |
+
+**Minimal compositor event loop:**
+
+```rust
+use wayland_server::Display;
+
+let mut display = Display::<MyState>::new().unwrap();
+let socket = ListeningSocket::bind("wayland-0").unwrap();
+
+loop {
+    // Accept new clients
+    if let Some(stream) = socket.accept().unwrap() {
+        display.handle().insert_client(stream, Arc::new(MyClientData)).unwrap();
+    }
+
+    // Dispatch all pending client requests
+    display.dispatch_clients(&mut state).unwrap();
+
+    // Flush events to clients
+    display.flush_clients().unwrap();
+}
+```
+
+---
+
+### `DisplayHandle`
+
+`DisplayHandle` is a clonable, type-erased handle to the Wayland display state. It is the type used for all protocol interactions outside of the main dispatch loop. You can obtain it from `Display::handle()` or from any `Dispatch` / `GlobalDispatch` callback.
+
+```rust
+#[derive(Clone, Debug)]
+pub struct DisplayHandle { /* private */ }
+```
+
+#### Methods
+
+| Method | Signature | Description |
+|---|---|---|
+| `backend_handle` | `(&self) -> Handle` | Returns the underlying `wayland-backend` `Handle`. |
+| `insert_client` | `(&mut self, stream: UnixStream, data: Arc<dyn ClientData>) -> std::io::Result<Client>` | Register a new client connection. The `data` will be accessible via `Client::get_data()`. |
+| `get_client` | `(&self, id: ObjectId) -> Result<Client, InvalidId>` | Look up the client that owns the object with the given ID. |
+| `create_global` | `<State, I: Resource + 'static, U>(&self, version: u32, data: U) -> GlobalId` where `U: GlobalDispatch<I, State> + Send + Sync + 'static` | Advertise a new global to clients. The `GlobalDispatch::bind()` method on `data` will be called whenever a client binds the global. |
+| `disable_global` | `<State: 'static>(&self, id: GlobalId)` | Stop advertising a global to new clients. Clients that already know about it can still bind it; the state is preserved. |
+| `remove_global` | `<State: 'static>(&self, id: GlobalId)` | Remove a global entirely. Clients that already know about it will receive a `global_remove` event. Any subsequent bind attempt will result in a protocol error. |
+| `object_info` | `(&self, id: ObjectId) -> Result<ObjectInfo, InvalidId>` | Retrieve interface and version information for an object. |
+| `send_event` | `<I: Resource>(&self, resource: &I, event: I::Event<'_>) -> Result<(), InvalidId>` | Send an event to a resource. Prefer `Resource::send_event()` for convenience. |
+| `post_error` | `<I: Resource>(&self, resource: &I, code: u32, error: String)` | Post a protocol error, disconnecting the client. Prefer `Resource::post_error()`. |
+| `get_object_data` | `(&self, id: ObjectId) -> Result<Arc<dyn Any + Send + Sync + 'static>, InvalidId>` | Retrieve the raw object data. Prefer `Resource::object_data()`. |
+| `flush_clients` | `(&mut self) -> std::io::Result<()>` | Flush pending outgoing events to all client sockets. |
+| `set_default_max_buffer_size` | `(&self, max_buffer_size: usize)` | Set the default maximum send buffer size for new clients. Requires `libwayland_1_23` feature. |
+
+<Warning>
+  When removing a global with `remove_global`, it is strongly recommended to first call `disable_global` and wait a few seconds to avoid a race where a client binds the global at the same moment it is removed.
+</Warning>
+
+---
+
+## The `Resource` trait
+
+Every Wayland object created by a client is represented by a type implementing `Resource`. These types are code-generated from Wayland XML protocol specifications (e.g. `WlSurface`, `WlBuffer`, `XdgToplevel`).
+
+```rust
+pub trait Resource: Clone + std::fmt::Debug + Sized + 'static {
+    type Event<'a>;
+    type Request;
+
+    fn interface() -> &'static Interface;
+    fn id(&self) -> ObjectId;
+    fn client(&self) -> Option<Client>;
+    fn version(&self) -> u32;
+    fn is_alive(&self) -> bool;
+    fn data<U: 'static>(&self) -> Option<&U>;
+    fn object_data(&self) -> Option<&Arc<dyn Any + Send + Sync>>;
+    fn handle(&self) -> &backend::WeakHandle;
+    fn from_id(dh: &DisplayHandle, id: ObjectId) -> Result<Self, InvalidId>;
+    fn send_event(&self, evt: Self::Event<'_>) -> Result<(), InvalidId>;
+    fn post_error(&self, code: impl Into<u32>, error: impl Into<String>);
+    fn parse_request(
+        dh: &DisplayHandle,
+        msg: Message<ObjectId, OwnedFd>,
+    ) -> Result<(Self, Self::Request), DispatchError>;
+    fn write_event<'a>(
+        &self,
+        dh: &DisplayHandle,
+        req: Self::Event<'a>,
+    ) -> Result<Message<ObjectId, BorrowedFd<'a>>, InvalidId>;
+    fn downgrade(&self) -> Weak<Self>;
+}
+```
+
+#### Key method descriptions
+
+| Method | Description |
+|---|---|
+| `interface()` | Returns the static `Interface` descriptor (name, version, requests, events). |
+| `id()` | Returns the `ObjectId` identifying this object in the protocol stream. |
+| `client()` | Returns the `Client` that owns this object. Returns `None` if the object is no longer alive. |
+| `version()` | Returns the negotiated protocol version for this object. |
+| `is_alive()` | Returns `true` if the object is still alive in the protocol state. |
+| `data::<U>()` | Downcast and return the typed user-data `U` associated with this object (set via `DataInit::init()`). Returns `None` on type mismatch. |
+| `object_data()` | Access the raw `Arc<dyn Any + Send + Sync>` object data. |
+| `handle()` | Access the weak handle to the backend. |
+| `from_id(dh, id)` | Reconstruct a resource from a raw `ObjectId`. Errors if the ID doesn't match the interface. |
+| `send_event(evt)` | Send an event of type `Self::Event<'_>` to the client. |
+| `post_error(code, error)` | Trigger a protocol error on this object, killing the client connection. The `code` should come from the interface's `Error` enum. |
+| `parse_request(dh, msg)` | Decode a raw protocol message into `(resource, request)`. Used internally by scanner-generated code. |
+| `write_event(dh, req)` | Encode a typed event into a raw `Message`. Used internally. |
+| `downgrade()` | Create a `Weak<Self>` handle that does not keep user-data alive (avoids reference cycles). |
+
+### `Weak<I>`
+
+```rust
+#[derive(Debug, Clone)]
+pub struct Weak<I> { /* private */ }
+```
+
+A weak reference to a Wayland resource. Useful for storing resources in user-data of other objects without creating reference cycles.
+
+| Method | Signature | Description |
+|---|---|---|
+| `upgrade` | `(&self) -> Result<I, InvalidId>` | Try to upgrade back to a full resource. Fails if the object or connection is gone. |
+| `is_alive` | `(&self) -> bool` | Check whether the underlying object is still alive. |
+| `id` | `(&self) -> ObjectId` | Returns the underlying object ID. |
+
+`Weak<I>` implements `PartialEq`, `Eq`, `Hash`, and `PartialEq<I>`.
+
+---
+
+### `GlobalDispatch<I, State>`
+
+`GlobalDispatch` is implemented on a user-data type to handle the lifecycle of a protocol global. It is the server-side counterpart to how clients bind globals.
+
+```rust
+pub trait GlobalDispatch<I: Resource, State> {
+    fn bind(
+        &self,
+        state: &mut State,
+        handle: &DisplayHandle,
+        client: &Client,
+        resource: New<I>,
+        data_init: &mut DataInit<'_, State>,
+    );
+
+    fn can_view(&self, _client: &Client) -> bool {
+        true
+    }
+}
+```
+
+#### Methods
+
+| Method | Description |
+|---|---|
+| `bind(state, handle, client, resource, data_init)` | Called when a client binds this global. You **must** initialize the `New<I>` resource using `data_init.init(resource, user_data)` before returning. Failing to do so will panic. |
+| `can_view(client)` | Called to check if a given client should be able to see this global in the registry. Default implementation returns `true` (visible to all). Use this for privileged protocols. |
+
+**Example:**
+
+```rust
+use wayland_server::{
+    protocol::wl_compositor::{self, WlCompositor},
+    Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, New,
+};
+
+struct CompositorGlobal;
+struct CompositorState;
+
+impl GlobalDispatch<WlCompositor, MyState> for CompositorGlobal {
+    fn bind(
+        &self,
+        state: &mut MyState,
+        _handle: &DisplayHandle,
+        _client: &Client,
+        resource: New<WlCompositor>,
+        data_init: &mut DataInit<'_, MyState>,
+    ) {
+        data_init.init(resource, CompositorState);
+    }
+}
+```
+
+---
+
+### `Dispatch<R, State>`
+
+`Dispatch` is implemented on user-data types to handle incoming requests from a client on a specific resource interface.
+
+```rust
+pub trait Dispatch<I: Resource, State> {
+    fn request(
+        &self,
+        state: &mut State,
+        client: &Client,
+        resource: &I,
+        request: I::Request,
+        dhandle: &DisplayHandle,
+        data_init: &mut DataInit<'_, State>,
+    );
+
+    fn destroyed(
+        &self,
+        _state: &mut State,
+        _client: ClientId,
+        _resource: &I,
+    ) {
+        // default: no-op
+    }
+}
+```
+
+#### Method parameters
+
+**`request()`:**
+
+| Parameter | Type | Description |
+|---|---|---|
+| `&self` | `&UserData` | The user-data associated with the specific resource. |
+| `state` | `&mut State` | Mutable reference to the compositor state. |
+| `client` | `&Client` | The client that sent the request. |
+| `resource` | `&I` | The resource object that received the request. |
+| `request` | `I::Request` | The decoded request enum, carrying all arguments. |
+| `dhandle` | `&DisplayHandle` | A handle to the display for sending events and creating new objects. |
+| `data_init` | `&mut DataInit<'_, State>` | Used to initialize any new objects created by this request. |
+
+**`destroyed()`:** Called when the client destroys this object. Use for cleanup. By default does nothing.
+
+<Warning>
+  If a request creates a new object (represented as `New<I>` in the `request` enum), you **must** call `data_init.init()` on it. Failing to initialize a newly created object causes a panic.
+</Warning>
+
+---
+
+### `Client`
+
+Represents a connected Wayland client.
+
+```rust
+#[derive(Clone, Debug)]
+pub struct Client { /* private */ }
+```
+
+| Method | Signature | Description |
+|---|---|---|
+| `id` | `(&self) -> ClientId` | Returns the backend `ClientId`. |
+| `get_data` | `<Data: ClientData + 'static>(&self) -> Option<&Data>` | Access the typed `ClientData` associated with this client (provided at `insert_client` time). Returns `None` on type mismatch. |
+| `get_credentials` | `(&self, handle: &DisplayHandle) -> Result<Credentials, InvalidId>` | Retrieve the `pid`, `uid`, and `gid` of the client process. |
+| `create_resource` | `<I, U, D>(&self, handle: &DisplayHandle, version: u32, user_data: U) -> Result<I, InvalidId>` | Server-side creation of a new Wayland object in this client's protocol state. The object should immediately be sent to the client via an event. |
+| `create_resource_from_objdata` | `<I: Resource + 'static, D: 'static>(&self, handle: &DisplayHandle, version: u32, obj_data: Arc<dyn ObjectData<D>>) -> Result<I, InvalidId>` | Low-level variant of `create_resource` using a raw `ObjectData`. |
+| `object_from_protocol_id` | `<I: Resource + 'static>(&self, handle: &DisplayHandle, protocol_id: u32) -> Result<I, InvalidId>` | Look up an object in this client's state by its raw Wayland protocol id. |
+| `kill` | `(&self, handle: &DisplayHandle, error: ProtocolError)` | Forcibly disconnect the client with a protocol error. |
+| `global_name` | `(&self, handle: &DisplayHandle, global: GlobalId) -> Option<u32>` | Get the `wl_registry` name as seen by this client. Requires `libwayland_1_22`. |
+| `set_max_buffer_size` | `(&self, handle: &DisplayHandle, max_buffer_size: usize)` | Override the maximum send buffer size for this client. Requires `libwayland_1_23`. |
+
+<Note>
+  Be cautious when using `get_credentials()` for security decisions. The PID/UID/GID can be spoofed; see the [Weston security discussion](https://gitlab.freedesktop.org/wayland/weston/-/issues/206) for details.
+</Note>
+
+---
+
+### `ListeningSocket`
+
+A Unix socket that listens for incoming client connections.
+
+```rust
+#[derive(Debug)]
+pub struct ListeningSocket { /* private */ }
+```
+
+`ListeningSocket` implements `AsFd` and `AsRawFd`, providing the listening socket file descriptor for use with `epoll` or similar.
+
+#### Constructors
+
+| Method | Signature | Description |
+|---|---|---|
+| `bind` | `<S: AsRef<OsStr>>(socket_name: S) -> Result<Self, BindError>` | Create a socket with the given name in `$XDG_RUNTIME_DIR`. Also acquires an associated lock file. |
+| `bind_auto` | `(basename: &str, range: impl IntoIterator<Item = usize>) -> Result<Self, BindError>` | Try names `{basename}-{n}` for each `n` in `range`, returning the first that succeeds. Useful for finding a free display number. |
+| `bind_absolute` | `(socket_path: PathBuf) -> Result<Self, BindError>` | Create a socket at an absolute path. |
+
+#### Instance methods
+
+| Method | Signature | Description |
+|---|---|---|
+| `accept` | `(&self) -> io::Result<Option<UnixStream>>` | Non-blocking accept. Returns `Ok(None)` if no connection is waiting. The returned stream must be passed to `DisplayHandle::insert_client()`. |
+| `socket_name` | `(&self) -> Option<&OsStr>` | Returns the socket name (relative), or `None` if created with `bind_absolute`. |
+
+On `Drop`, the socket file and its lock file are automatically removed.
+
+### `BindError`
+
+Returned when `ListeningSocket::bind()` fails.
+
+```rust
+#[derive(Debug)]
+pub enum BindError {
+    RuntimeDirNotSet,
+    PermissionDenied,
+    AlreadyInUse,
+    Io(io::Error),
+}
+```
+
+| Variant | Description |
+|---|---|
+| `RuntimeDirNotSet` | The `XDG_RUNTIME_DIR` environment variable is not set or is not an absolute path. |
+| `PermissionDenied` | The application could not create files in `XDG_RUNTIME_DIR`. |
+| `AlreadyInUse` | The requested socket name is already locked by another process. |
+| `Io(io::Error)` | Some other I/O error occurred. |
+
+---
+
+### `DataInit<'a, D>`
+
+Provided to your `Dispatch::request()` and `GlobalDispatch::bind()` callbacks to initialize newly created protocol objects.
+
+```rust
+#[derive(Debug)]
+pub struct DataInit<'a, D: 'static> { /* private */ }
+```
+
+| Method | Signature | Description |
+|---|---|---|
+| `init` | `<I: Resource + 'static, U>(&mut self, resource: New<I>, data: U) -> I` where `U: Dispatch<I, D> + Send + Sync + 'static` | Initialize a client-created object with typed user-data. Returns the initialized resource. Must be called exactly once for each `New<I>` received. |
+| `custom_init` | `<I: Resource + 'static>(&mut self, resource: New<I>, data: Arc<dyn ObjectData<D>>) -> I` | Initialize with a raw `ObjectData`. Use when bypassing the `Dispatch` trait. |
+| `post_error` | `<I: Resource + 'static>(&mut self, resource: New<I>, code: impl Into<u32>, error: impl Into<String>)` | Post a protocol error on an uninitialized object (e.g. in `GlobalDispatch::bind()` to reject a bind). |
+
+### `New<I>`
+
+A wrapper around a newly created Wayland object that has not yet been initialized with user-data.
+
+```rust
+#[derive(Debug)]
+#[must_use = "The protocol object must be initialized using DataInit"]
+pub struct New<I> { /* private */ }
+```
+
+Pass a `New<I>` to `DataInit::init()`. The `#[must_use]` attribute ensures the compiler warns if initialization is forgotten.
+
+---
+
+### `DispatchError`
+
+Returned when a client message cannot be decoded.
+
+```rust
+#[derive(Debug)]
+pub enum DispatchError {
+    BadMessage {
+        sender_id: ObjectId,
+        interface: &'static str,
+        opcode: u16,
+    },
+}
+```
+
+| Variant | Description |
+|---|---|
+| `BadMessage { sender_id, interface, opcode }` | The received message does not match the interface specification. The client will be killed with a protocol error. |
+
+---
+
+## The `backend` module
+
+The `wayland_server::backend` module re-exports low-level types from `wayland-backend` for advanced use cases.
+
+```rust
+pub mod backend {
+    pub use wayland_backend::protocol;
+    pub use wayland_backend::server::{
+        Backend,
+        ClientData,
+        ClientId,
+        Credentials,
+        DisconnectReason,
+        GlobalHandler,
+        GlobalId,
+        Handle,
+        InitError,
+        InvalidId,
+        ObjectData,
+        ObjectId,
+        WeakHandle,
+    };
+    pub use wayland_backend::smallvec;
+}
+```
+
+| Re-export | Description |
+|---|---|
+| `Backend` | The raw server backend managing all client connections and protocol state. |
+| `ClientData` | Trait for associating custom data with a client connection. |
+| `ClientId` | Opaque identifier for a connected client. |
+| `Credentials` | Holds the `pid`, `uid`, and `gid` of a client process. |
+| `DisconnectReason` | Enum describing why a client was disconnected (protocol error, I/O error, etc.). |
+| `GlobalHandler` | Low-level trait for handling global bind callbacks. Implemented internally by `GlobalData`. |
+| `GlobalId` | Opaque identifier for a registered global. |
+| `Handle` | A clonable handle to the backend, wrapped by `DisplayHandle`. |
+| `InitError` | Error returned by `Display::new()` when the backend cannot be initialized. |
+| `InvalidId` | Error type indicating an `ObjectId` or `ClientId` is no longer valid. |
+| `ObjectData` | Low-level trait for associating callbacks directly with protocol objects, bypassing `Dispatch`. |
+| `ObjectId` | Opaque identifier for a protocol object. Convertible to/from `*mut wl_resource` when the `system` feature is enabled. |
+| `WeakHandle` | A weak reference to a `Handle`, stored inside resource types. |
+| `protocol` | Re-export of `wayland-backend`'s protocol primitives (`Message`, `Interface`, etc.). |
+| `smallvec` | Re-export of `smallvec` used for message argument lists. |
+
+### FFI interop
+
+When the `system` feature is enabled, you can interoperate with the C Wayland library:
+
+- Retrieve the `*mut wl_display` pointer: call `display.backend().handle().display_ptr()`.
+- Retrieve `*mut wl_resource` for an object: use `resource.id()` then `ObjectId::as_ptr()`.
+- Import a `*mut wl_resource` from external code: use `ObjectId::from_ptr()` then `Resource::from_id()`.

@@ -1,0 +1,116 @@
+---
+title: "wayland-rs: Rust bindings for the Wayland protocol"
+sidebarTitle: "Introduction"
+description: "wayland-rs is a workspace of 12 Rust crates providing pure-Rust and system-backed bindings for the Wayland display protocol."
+---
+
+wayland-rs is the definitive Rust implementation of the [Wayland display protocol](https://wayland.freedesktop.org/), the modern replacement for X11 on Linux and other Unix-like systems. Rather than generating thin wrappers over the C `libwayland` libraries, wayland-rs ships its own **pure-Rust protocol implementation** alongside optional C-library bindings — giving you the choice of a fully self-contained binary or seamless interoperability with the rest of the Wayland ecosystem. The workspace is structured as a set of focused crates that you compose according to your use case, from writing a desktop application to building a full compositor.
+
+## What problem does wayland-rs solve?
+
+The Wayland protocol is defined by XML specifications that describe objects, interfaces, requests, and events. Consuming this protocol in a safe, ergonomic way from Rust requires:
+
+- **FFI safety**: wrapping `libwayland-client.so` / `libwayland-server.so` without exposing unsafe code to callers.
+- **Protocol code generation**: turning XML specs into strongly-typed Rust structs, enums, and trait impls at compile time.
+- **Backend flexibility**: supporting both a pure-Rust protocol engine (for static, dependency-free builds) and the system C libraries (for FFI interoperability with native Wayland code).
+- **Extension protocols**: bundling the entire official `wayland-protocols` extension set so you don't have to generate bindings yourself.
+
+wayland-rs handles all of these concerns in a single, coherent crate workspace maintained under the [Smithay](https://github.com/Smithay) umbrella project.
+
+## Core crates
+
+These are the three crates most applications and compositors will add directly to their `Cargo.toml`.
+
+<CardGroup cols={3}>
+  <Card title="wayland-client" icon="display" href="https://docs.rs/wayland-client">
+    Client-side bindings for the Wayland protocol. Provides the infrastructure for connecting to a compositor, managing Wayland objects, and dispatching events. This is the starting point for any Wayland application.
+  </Card>
+  <Card title="wayland-server" icon="server" href="https://docs.rs/wayland-server">
+    Server-side (compositor-side) bindings. Exposes the same typed object model as `wayland-client` but from the compositor's perspective — handling client connections, resource lifetimes, and request dispatch.
+  </Card>
+  <Card title="wayland-protocols" icon="puzzle-piece" href="https://docs.rs/wayland-protocols">
+    Pre-generated bindings for the official [wayland-protocols](https://gitlab.freedesktop.org/wayland/wayland-protocols) extension repository. Includes stable, staging, and unstable protocol sets, each guarded by a Cargo feature.
+  </Card>
+</CardGroup>
+
+## Auxiliary crates
+
+<CardGroup cols={2}>
+  <Card title="wayland-egl" icon="square-code" href="https://docs.rs/wayland-egl">
+    Enables OpenGL and Vulkan rendering by creating an `EGLSurface` from any `WlSurface`. Required for GPU-accelerated client applications using EGL.
+  </Card>
+  <Card title="wayland-cursor" icon="arrow-pointer" href="https://docs.rs/wayland-cursor">
+    Loads XCursor images from the system cursor theme and uploads them into `WlBuffer`s. Handles the metadata required to display animated cursors correctly.
+  </Card>
+</CardGroup>
+
+## Additional protocol extension crates
+
+Beyond the core `wayland-protocols` crate, the workspace also publishes pre-generated bindings for several widely used third-party protocol collections:
+
+| Crate | Description |
+|---|---|
+| `wayland-protocols-wlr` | [wlroots](https://gitlab.freedesktop.org/wlroots/wlr-protocols) protocol extensions, popular on tiling compositors |
+| `wayland-protocols-plasma` | KDE Plasma-specific protocol extensions |
+| `wayland-protocols-misc` | Miscellaneous community protocol extensions |
+| `wayland-protocols-experimental` | Experimental protocols not yet in any official set |
+
+## Requirements
+
+<Note>
+  wayland-rs requires **Rust 1.86 or later**. If you use the `system` Cargo feature (which delegates protocol handling to the C libraries), you also need **libwayland 1.15 or later** installed on the target system. The pure-Rust backend has no native library dependency at all.
+</Note>
+
+## Pure-Rust backend vs. system backend
+
+wayland-rs gives you two distinct protocol engines, switchable per crate via Cargo features:
+
+<Tabs>
+  <Tab title="Pure-Rust backend (default)">
+    The default backend is a complete Rust reimplementation of the Wayland wire protocol. It links no native libraries, making your binary fully self-contained. This is the right choice for:
+
+    - Applications distributed as static or portable binaries.
+    - Environments where `libwayland` may not be present (e.g. embedded, container images).
+    - Testing and CI, where you want to avoid system library dependencies.
+
+    ```toml
+    # Cargo.toml — no extra features needed; pure-Rust is the default
+    [dependencies]
+    wayland-client = "0.31"
+    ```
+  </Tab>
+  <Tab title="System backend">
+    Enabling the `system` feature on `wayland-client` or `wayland-server` switches the underlying backend to use the system-installed `libwayland-client.so` / `libwayland-server.so`. Use this when:
+
+    - You need FFI interoperability: passing raw `wl_display*` or `wl_resource*` pointers to or from C libraries.
+    - You want to embed wayland-rs inside a larger native Wayland project.
+    - You require precise version-locked behaviour from the reference C implementation.
+
+    ```toml
+    # Cargo.toml — opt into the C-library backend
+    [dependencies]
+    wayland-client = { version = "0.31", features = ["system"] }
+    ```
+
+    For deployments that may run on non-Wayland desktops (e.g. X11 sessions), add the `dlopen` feature. This loads `libwayland-*.so` dynamically at runtime instead of linking it at build time, allowing your binary to start gracefully and fall back to X11 when Wayland is unavailable:
+
+    ```toml
+    [dependencies]
+    wayland-client = { version = "0.31", features = ["system", "dlopen"] }
+    ```
+  </Tab>
+</Tabs>
+
+<Tip>
+  You can mix backends across your dependency tree. Because both backends expose identical APIs through the `wayland-backend` re-exports, enabling `system` in one crate automatically upgrades the backend for all crates that rely on `wayland-backend` — no code changes required.
+</Tip>
+
+## Looking for a higher-level toolkit?
+
+wayland-client is intentionally a **low-level** crate. It gives you full control over every Wayland object and event, but leaves application-level concerns such as seat handling, output management, and surface roles to you.
+
+If you are writing a desktop application and want batteries-included abstractions, consider [**Smithay's Client Toolkit (`smithay-client-toolkit`)**](https://crates.io/crates/smithay-client-toolkit), which is built directly on top of `wayland-client` and `wayland-protocols` and provides ready-made helpers for windows, popups, input, theming, and more.
+
+## Community and support
+
+Discussion about wayland-rs — for both development and user support — happens in the Matrix chatroom [**#wayland-rs:matrix.org**](https://matrix.to/#/#wayland-rs:matrix.org). Bug reports and feature requests are tracked on [GitHub](https://github.com/Smithay/wayland-rs/issues).
