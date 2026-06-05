@@ -51,9 +51,9 @@ use wayland_protocols::xdg::shell::client::{xdg_surface, xdg_toplevel, xdg_wm_ba
 
 Because XDG Shell is a stable protocol, no additional feature flags are needed.
 
-#### Complete client example
+#### Client example
 
-The following is the full `simple_window` example from the `wayland-client` crate. It binds `xdg_wm_base` from the registry, creates an `xdg_surface` over a `wl_surface`, promotes it to an `xdg_toplevel`, and handles the mandatory `configure`/`ack_configure` handshake before attaching a buffer.
+The following is based on the `simple_window` example from the `wayland-client` crate (abbreviated to focus on XDG Shell). It binds `xdg_wm_base` from the registry, creates an `xdg_surface` over a `wl_surface`, promotes it to an `xdg_toplevel`, and handles the mandatory `configure`/`ack_configure` handshake before attaching a buffer.
 
 ```rust
 use std::{fs::File, os::unix::io::AsFd};
@@ -84,6 +84,8 @@ fn main() {
         xdg_surface: None,
         configured: false,
     };
+
+    println!("Starting the example window app, press <ESC> to quit.");
 
     while state.running {
         event_queue.blocking_dispatch(&mut state).unwrap();
@@ -120,6 +122,32 @@ impl Dispatch<wl_registry::WlRegistry, State> for GlobalData {
                         state.init_xdg_surface(qh);
                     }
                 }
+                "wl_shm" => {
+                    let shm = registry.bind::<wl_shm::WlShm, _, _>(name, 1, qh, NoopIgnore);
+
+                    let (init_w, init_h) = (320, 240);
+
+                    let mut file = tempfile::tempfile().unwrap();
+                    draw(&mut file, (init_w, init_h));
+                    let pool =
+                        shm.create_pool(file.as_fd(), (init_w * init_h * 4) as i32, qh, NoopIgnore);
+                    let buffer = pool.create_buffer(
+                        0,
+                        init_w as i32,
+                        init_h as i32,
+                        (init_w * 4) as i32,
+                        wl_shm::Format::Argb8888,
+                        qh,
+                        NoopIgnore,
+                    );
+                    state.buffer = Some(buffer.clone());
+
+                    if state.configured {
+                        let surface = state.base_surface.as_ref().unwrap();
+                        surface.attach(Some(&buffer), 0, 0);
+                        surface.commit();
+                    }
+                }
                 "wl_seat" => {
                     registry.bind::<wl_seat::WlSeat, _, _>(name, 1, qh, GlobalData);
                 }
@@ -136,6 +164,21 @@ impl Dispatch<wl_registry::WlRegistry, State> for GlobalData {
             }
         }
     }
+}
+
+fn draw(tmp: &mut File, (buf_x, buf_y): (u32, u32)) {
+    use std::{cmp::min, io::Write};
+    let mut buf = std::io::BufWriter::new(tmp);
+    for y in 0..buf_y {
+        for x in 0..buf_x {
+            let a = 0xFF;
+            let r = min(((buf_x - x) * 0xFF) / buf_x, ((buf_y - y) * 0xFF) / buf_y);
+            let g = min((x * 0xFF) / buf_x, ((buf_y - y) * 0xFF) / buf_y);
+            let b = min(((buf_x - x) * 0xFF) / buf_x, (y * 0xFF) / buf_y);
+            buf.write_all(&[b as u8, g as u8, r as u8, a as u8]).unwrap();
+        }
+    }
+    buf.flush().unwrap();
 }
 
 impl State {
@@ -202,6 +245,41 @@ impl Dispatch<xdg_toplevel::XdgToplevel, State> for GlobalData {
     ) {
         if let xdg_toplevel::Event::Close = event {
             state.running = false;
+        }
+    }
+}
+
+impl Dispatch<wl_seat::WlSeat, State> for GlobalData {
+    fn event(
+        &self,
+        _: &mut State,
+        seat: &wl_seat::WlSeat,
+        event: wl_seat::Event,
+        _: &Connection,
+        qh: &QueueHandle<State>,
+    ) {
+        if let wl_seat::Event::Capabilities { capabilities } = event {
+            if capabilities.contains(wl_seat::Capability::Keyboard) {
+                seat.get_keyboard(qh, GlobalData);
+            }
+        }
+    }
+}
+
+impl Dispatch<wl_keyboard::WlKeyboard, State> for GlobalData {
+    fn event(
+        &self,
+        state: &mut State,
+        _: &wl_keyboard::WlKeyboard,
+        event: wl_keyboard::Event,
+        _: &Connection,
+        _: &QueueHandle<State>,
+    ) {
+        if let wl_keyboard::Event::Key { key, .. } = event {
+            if key == 1 {
+                // ESC key
+                state.running = false;
+            }
         }
     }
 }

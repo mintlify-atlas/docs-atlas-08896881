@@ -1,7 +1,7 @@
 ---
-title: "wayland-client API reference"
+title: "wayland-client: Connection, EventQueue, Dispatch Reference"
 sidebarTitle: "wayland-client"
-description: "Complete API reference for wayland-client 0.31: Connection, EventQueue, Dispatch, QueueHandle, Proxy, and the globals module."
+description: "API reference for wayland-client 0.31.x: Connection, EventQueue, Dispatch, QueueHandle, Proxy trait, and the globals initialization module."
 ---
 
 The `wayland-client` crate provides Rust bindings for the Wayland protocol on the client side. It is structured around four central concepts: the [`Connection`](#connection) that manages your socket to the compositor, [`EventQueue<D>`](#eventqueue) that dispatches protocol events to your state, proxies implementing the [`Proxy`](#the-proxy-trait) trait that represent Wayland objects, and the [`Dispatch`](#dispatch) trait that ties event handling logic to your state type.
@@ -25,6 +25,7 @@ wayland-client = "0.31"
 |---|---|
 | `system` | Link against the system-installed `libwayland-client.so` rather than using the built-in pure-Rust backend. Required for FFI interop (e.g. `raw-window-handle`). |
 | `dlopen` | Load `libwayland-client.so` at runtime via `dlopen` instead of linking it at build time. Implies `system`. |
+| `log` | Route internal diagnostic messages through the [`log`](https://docs.rs/log) crate instead of printing directly to stderr. |
 | `libwayland_1_23` | Enable APIs that require libwayland ≥ 1.23 (e.g. `Connection::set_max_buffer_size`). |
 
 Example with features:
@@ -195,7 +196,7 @@ Drop the guard to resume normal dispatch.
 
 ### `Dispatch<I, State>`
 
-The `Dispatch` trait is the central event-handling abstraction. Your state type must implement `Dispatch<I, UserData, State>` for every Wayland interface `I` whose events you want to process.
+The `Dispatch` trait is the central event-handling abstraction. Your user-data type must implement `Dispatch<I, State>` for every Wayland interface `I` whose events you want to process.
 
 ```rust
 pub trait Dispatch<I, State>
@@ -218,7 +219,7 @@ where
 ```
 
 <Note>
-  `Dispatch` is implemented on the **user-data type** (second type parameter), not directly on the state. This allows multiple implementations for the same interface with different user-data types, and makes generic delegation straightforward.
+  `Dispatch<I, State>` is implemented on the **user-data type** (the `Self` / `&self` type), not directly on the state. The first type parameter `I` is the Wayland interface proxy, and the second `State` is your application state passed as `&mut State` to every event handler. This design allows multiple implementations for the same interface with different user-data types, and makes generic delegation straightforward.
 </Note>
 
 **Parameters passed to `event()`:**

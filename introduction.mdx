@@ -1,7 +1,7 @@
 ---
-title: "wayland-rs: Rust bindings for the Wayland protocol"
+title: "wayland-rs: Rust Bindings for the Wayland Display Protocol"
 sidebarTitle: "Introduction"
-description: "wayland-rs is a workspace of 12 Rust crates providing pure-Rust and system-backed bindings for the Wayland display protocol."
+description: "wayland-rs provides pure-Rust and system-backed Rust crates for the Wayland display protocol, covering clients, compositors, and extension protocols."
 ---
 
 wayland-rs is the definitive Rust implementation of the [Wayland display protocol](https://wayland.freedesktop.org/), the modern replacement for X11 on Linux and other Unix-like systems. Rather than generating thin wrappers over the C `libwayland` libraries, wayland-rs ships its own **pure-Rust protocol implementation** alongside optional C-library bindings — giving you the choice of a fully self-contained binary or seamless interoperability with the rest of the Wayland ecosystem. The workspace is structured as a set of focused crates that you compose according to your use case, from writing a desktop application to building a full compositor.
@@ -40,7 +40,7 @@ These are the three crates most applications and compositors will add directly t
     Enables OpenGL and Vulkan rendering by creating an `EGLSurface` from any `WlSurface`. Required for GPU-accelerated client applications using EGL.
   </Card>
   <Card title="wayland-cursor" icon="arrow-pointer" href="https://docs.rs/wayland-cursor">
-    Loads XCursor images from the system cursor theme and uploads them into `WlBuffer`s. Handles the metadata required to display animated cursors correctly.
+    Pure-Rust reimplementation of cursor-theme loading. Reads XCursor images from the system theme, uploads pixel data into `WlBuffer`s, and provides frame timing for animated cursors.
   </Card>
 </CardGroup>
 

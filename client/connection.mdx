@@ -105,7 +105,7 @@ match Connection::connect_to_env() {
     Use this when you need `raw-window-handle` support, when embedding in a GTK/Qt application, or when integrating with any other C Wayland consumer.
   </Tab>
   <Tab title="dlopen feature">
-    Like `system`, but dynamically loads `libwayland-client.so` at *runtime* rather than linking at compile time. The binary can start on systems without Wayland installed and gracefully degrade.
+    Like `system`, but dynamically loads `libwayland-client.so` at *runtime* rather than linking at compile time. The binary can start on systems without Wayland installed and gracefully degrade. Requires `system` to take effect.
 
     ```toml
     [dependencies]
@@ -113,7 +113,7 @@ match Connection::connect_to_env() {
     ```
 
     <Tip>
-    `dlopen` implies `system`. When the load fails, `Connection::connect_to_env()` returns `ConnectError::NoWaylandLib`, which you can use to fall back to a different display system (X11, software renderer, etc.).
+    `dlopen` depends on `system` to be meaningful. When the library fails to load at runtime, `Connection::connect_to_env()` returns `ConnectError::NoWaylandLib`, which you can use to fall back to a different display system (X11, software renderer, etc.).
     </Tip>
   </Tab>
 </Tabs>
@@ -190,7 +190,7 @@ Returns the last protocol error recorded by the compositor, if any. Once a proto
 if let Some(err) = conn.protocol_error() {
     eprintln!(
         "Protocol error on object {}@{}: {} (code {})",
-        err.interface, err.object_id, err.message, err.code
+        err.object_interface, err.object_id, err.message, err.code
     );
 }
 ```

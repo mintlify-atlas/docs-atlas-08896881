@@ -1,7 +1,7 @@
 ---
-title: "wayland-protocols crate reference"
+title: "wayland-protocols: xdg, wp, ext, xwayland Module Guide"
 sidebarTitle: "wayland-protocols"
-description: "Reference for wayland-protocols 0.32: stable, staging, and unstable Wayland extension protocols organized by namespace (xdg, wp, ext, xwayland)."
+description: "Reference for wayland-protocols 0.32.x: stable, staging, and unstable Wayland extension protocols organized by namespace (xdg, wp, ext, xwayland)."
 ---
 
 The `wayland-protocols` crate provides generated Rust bindings for the official Wayland protocol extensions maintained at [gitlab.freedesktop.org/wayland/wayland-protocols](https://gitlab.freedesktop.org/wayland/wayland-protocols). These bindings are layered on top of `wayland-client` and `wayland-server`, giving you typed access to extension interfaces — from XDG shell window management to presentation timing and session locking.
@@ -129,7 +129,7 @@ General-purpose Wayland extension protocols not specific to any single subsystem
 | `wp::color_management::v1` | `wp_color_management_v1` | Staging | Describe color properties (SDR/HDR colorimetry) for surfaces and outputs. |
 | `wp::color_representation::v1` | `wp_color_representation_v1` | Staging | Describe YCbCr pixel format conversion parameters. |
 | `wp::content_type::v1` | `wp_content_type_v1` | Staging | Hint at the kind of content a surface will display (game, video, photo, etc.). |
-| `wp::cursor_shape::v1` | `wp_cursor_shape_v1` | Staging | Set a cursor from a named icon stock instead of a custom surface. |
+| `wp::cursor_shape::v1` | `wp_cursor_shape_v1` | Staging + Unstable | Set a cursor from a named icon stock instead of a custom surface. Requires both `staging` and `unstable` features. |
 | `wp::drm_lease::v1` | `wp_drm_lease_v1` | Staging | Lease DRM resources from a compositor for direct rendering (e.g. VR headsets). |
 | `wp::tearing_control::v1` | `wp_tearing_control_v1` | Staging | Opt into tearing page flips for lower-latency rendering. |
 | `wp::single_pixel_buffer::v1` | `wp_single_pixel_buffer_v1` | Staging | Create a single-pixel `wl_buffer` (combine with `viewporter` to fill solid-color regions). |

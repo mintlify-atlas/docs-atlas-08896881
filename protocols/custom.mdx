@@ -1,7 +1,7 @@
 ---
 title: "Generating Rust bindings for custom Wayland protocols"
 sidebarTitle: "Custom Protocols"
-description: "Use wayland-scanner proc-macros to generate type-safe Rust bindings from any Wayland XML protocol specification file."
+description: "Use wayland-scanner proc-macros to generate type-safe Rust client and server bindings from any Wayland XML protocol specification file at compile time."
 ---
 
 Every Wayland protocol is defined in an XML file. The standard toolchain converts that XML into C glue code; wayland-rs replaces that step with a set of procedural macros in the `wayland-scanner` crate that generate idiomatic Rust code at compile time. If the protocol you need is not already covered by `wayland-protocols`, `wayland-protocols-wlr`, or `wayland-protocols-plasma`, you can point these macros at your own XML file and get the same type-safe bindings that the official crates provide.
@@ -186,10 +186,10 @@ Suppose you have a custom compositor protocol in `protocols/my-bar-protocol.xml`
   </Step>
 
   <Step title="Use the generated types">
-    The macro generates one proxy struct per `<interface>` element in the XML. Assuming the XML declares `my_bar_manager_v1`, the type `my_bar_protocol::client::my_bar_manager_v1::MyBarManagerV1` is now available.
+    The macro generates one proxy struct per `<interface>` element in the XML directly inside the module. Assuming the XML declares `my_bar_manager_v1`, the type `my_bar_protocol::my_bar_manager_v1::MyBarManagerV1` is now available.
 
     ```rust
-    use my_bar_protocol::client::my_bar_manager_v1;
+    use my_bar_protocol::my_bar_manager_v1;
 
     impl Dispatch<wl_registry::WlRegistry, ()> for State {
         fn event(

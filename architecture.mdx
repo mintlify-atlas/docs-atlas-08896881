@@ -1,10 +1,10 @@
 ---
-title: "Architecture of the wayland-rs crate stack"
+title: "wayland-rs Architecture: Layers and Backend Selection"
 sidebarTitle: "Architecture"
-description: "Learn how wayland-rs organizes its 12 crates from raw FFI at the bottom to high-level typed protocol bindings at the top."
+description: "How wayland-rs organizes its crates in three layers, from raw FFI bindings to high-level typed Wayland protocol objects, and how backends propagate."
 ---
 
-wayland-rs is not a single crate — it is a carefully layered workspace of 12 crates, each with a precisely scoped responsibility. Understanding how those layers fit together helps you choose the right crates for your project, reason about compile-time features, and perform FFI integration confidently. This page walks through every layer from the raw C bindings at the bottom to the typed, ergonomic protocol objects at the top.
+wayland-rs is not a single crate — it is a carefully layered workspace of crates, each with a precisely scoped responsibility. Understanding how those layers fit together helps you choose the right crates for your project, reason about compile-time features, and perform FFI integration confidently. This page walks through every layer from the raw C bindings at the bottom to the typed, ergonomic protocol objects at the top.
 
 ## Three-layer architecture
 
@@ -185,10 +185,10 @@ wayland-protocols-wlr  = { version = "0.3",  features = ["client"] }
 
 ### `wayland-cursor` and `wayland-egl`
 
-These two auxiliary crates wrap specific `libwayland-cursor.so` and `libwayland-egl.so` functionality (via `wayland-sys`) and expose safe Rust APIs:
+These two auxiliary crates expose safe Rust APIs for cursor loading and EGL surface creation:
 
-- **`wayland-cursor`**: load cursor images from XCursor themes, upload pixels into `WlBuffer`s, and retrieve frame timing for animated cursors.
-- **`wayland-egl`**: create an `EGLSurface` from a `WlSurface` for OpenGL or Vulkan rendering.
+- **`wayland-cursor`**: a pure-Rust reimplementation of `libwayland-cursor` functionality. It uses the `xcursor` crate to load cursor images from XCursor themes, uploads pixel data into `WlBuffer`s via `wayland-client`, and retrieves frame timing for animated cursors. It does **not** depend on `wayland-sys` or link `libwayland-cursor.so`.
+- **`wayland-egl`**: wraps `libwayland-egl.so` via `wayland-sys` and exposes `WlEglSurface`, which creates an EGL window surface from a `wl_surface` object ID for OpenGL rendering.
 
 ## Crate dependency table
 
@@ -204,8 +204,8 @@ The table below captures the direct dependency relationships across the workspac
 | `wayland-protocols` | `wayland-client` and/or `wayland-server`, `wayland-scanner` |
 | `wayland-protocols-wlr` | `wayland-client` and/or `wayland-server`, `wayland-scanner` |
 | `wayland-protocols-plasma` | `wayland-client` and/or `wayland-server`, `wayland-scanner` |
-| `wayland-cursor` | `wayland-client`, `wayland-sys` |
-| `wayland-egl` | `wayland-client`, `wayland-sys` |
+| `wayland-cursor` | `wayland-client`, `xcursor` |
+| `wayland-egl` | `wayland-backend`, `wayland-sys` |
 
 ## Feature propagation in practice
 

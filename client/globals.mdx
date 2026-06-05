@@ -28,14 +28,17 @@ struct AppState {
     compositor_name: Option<u32>,
 }
 
+// Dispatch<WlRegistry, ()> is implemented for AppState.
+// `&self` here is AppState (the implementor / user-data type);
+// `state` gives mutable access to AppState.
 impl Dispatch<wl_registry::WlRegistry, ()> for AppState {
     fn event(
-        &mut self,
+        &self,
+        state: &mut AppState,
         registry: &wl_registry::WlRegistry,
         event: wl_registry::Event,
-        _: &(),
-        _: &Connection,
-        qh: &QueueHandle<Self>,
+        _conn: &Connection,
+        qh: &QueueHandle<AppState>,
     ) {
         match event {
             wl_registry::Event::Global { name, interface, version } => {
@@ -93,9 +96,9 @@ use wayland_client::{
 3. Performs a `Connection::roundtrip()` to collect the initial `wl_registry.global` flood into a `GlobalListContents` buffer.
 4. Returns the `GlobalList` (which owns the registry and the contents) plus the fresh event queue.
 
-### `Dispatch<WlRegistry, GlobalListContents>` requirement
+### `GlobalListContents: Dispatch<WlRegistry, State>` requirement
 
-To use `registry_queue_init`, your state must implement `Dispatch<WlRegistry, GlobalListContents>`. This is the implementation that will be called for *dynamic* registry events (globals added or removed after the initial roundtrip):
+To use `registry_queue_init`, `GlobalListContents` must implement `Dispatch<wl_registry::WlRegistry, State>` for your `State` type. `GlobalListContents` acts as the user-data for the registry object and its `event()` method will be called for *dynamic* registry events (globals added or removed after the initial roundtrip):
 
 ```rust
 use wayland_client::{
@@ -106,10 +109,12 @@ use wayland_client::{
 
 struct State;
 
+// `GlobalListContents` is the user-data type for the WlRegistry created by
+// `registry_queue_init`. `State` is your application state type.
 impl Dispatch<wl_registry::WlRegistry, State> for GlobalListContents {
     fn event(
         &self,
-        state: &mut State,
+        _state: &mut State,
         _proxy: &wl_registry::WlRegistry,
         event: wl_registry::Event,
         _conn: &Connection,
@@ -158,12 +163,12 @@ impl Dispatch<wl_registry::WlRegistry, State> for GlobalListContents {
 // Required: handle events for objects we bind
 impl Dispatch<wl_compositor::WlCompositor, ()> for State {
     fn event(
-        &mut self,
+        &self,
+        _state: &mut State,
         _proxy: &wl_compositor::WlCompositor,
         _event: wl_compositor::Event,
-        _data: &(),
         _conn: &Connection,
-        _qhandle: &QueueHandle<Self>,
+        _qhandle: &QueueHandle<State>,
     ) {
         // wl_compositor has no events
     }
@@ -171,12 +176,12 @@ impl Dispatch<wl_compositor::WlCompositor, ()> for State {
 
 impl Dispatch<wl_shm::WlShm, ()> for State {
     fn event(
-        &mut self,
+        &self,
+        _state: &mut State,
         _proxy: &wl_shm::WlShm,
         event: wl_shm::Event,
-        _data: &(),
         _conn: &Connection,
-        _qhandle: &QueueHandle<Self>,
+        _qhandle: &QueueHandle<State>,
     ) {
         // wl_shm.format events list supported pixel formats
         if let wl_shm::Event::Format { format } = event {

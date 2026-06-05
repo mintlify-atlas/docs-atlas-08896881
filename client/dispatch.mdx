@@ -23,9 +23,8 @@ where
     );
 
     // Optional: only needed when an event creates a new child object.
-    fn event_created_child(opcode: u16, qhandle: &QueueHandle<State>) -> Arc<dyn ObjectData> {
-        // default implementation panics
-    }
+    // Default implementation panics — override with the event_created_child! macro.
+    fn event_created_child(opcode: u16, qhandle: &QueueHandle<State>) -> Arc<dyn ObjectData> { .. }
 }
 ```
 
@@ -36,7 +35,7 @@ The two type parameters are:
 | `I: Proxy` | The Wayland interface whose events this implementation handles. |
 | `State` | Your top-level application state struct. |
 
-Notice that `Dispatch` is implemented *on the user-data type*, not directly on `State`. The `event()` method receives `&self` (the user data) and `&mut State` (the shared application state). This is the mechanism that lets different instances of the same interface be dispatched differently based on the user data attached to each object.
+`Dispatch<I, State>` is implemented **on the user-data type** (`Self` = user-data, not `State`). The `event()` method receives `&self` (the user data value attached to the object) and `&mut State` (the shared application state). This lets different instances of the same interface be dispatched differently based on the user data type attached to each object at creation time.
 
 ## The `event()` method parameters
 
@@ -61,7 +60,7 @@ When an event arrives for that surface, `wayland-client` looks up the user data,
 
 ### Simple case: `()` as user data
 
-When you have only one kind of object and no per-object state is needed:
+When you have only one kind of object and no per-object state is needed, implement `Dispatch` on `AppState` with `()` as the user-data type parameter:
 
 ```rust
 use wayland_client::{
@@ -72,19 +71,21 @@ struct AppState {
     compositor: Option<wayland_client::protocol::wl_compositor::WlCompositor>,
 }
 
+// Dispatch<WlRegistry, ()> is implemented for AppState.
+// `&self` is AppState; `state` is also &mut AppState here.
 impl Dispatch<wl_registry::WlRegistry, ()> for AppState {
     fn event(
-        &mut self,
+        &self,
+        state: &mut AppState,
         registry: &wl_registry::WlRegistry,
         event: wl_registry::Event,
-        _data: &(),
         _conn: &Connection,
-        qh: &QueueHandle<Self>,
+        qh: &QueueHandle<AppState>,
     ) {
         if let wl_registry::Event::Global { name, interface, version } = event {
             if interface == "wl_compositor" {
                 let comp = registry.bind(name, version.min(5), qh, ());
-                self.compositor = Some(comp);
+                state.compositor = Some(comp);
             }
         }
     }
@@ -93,7 +94,7 @@ impl Dispatch<wl_registry::WlRegistry, ()> for AppState {
 
 ### Storing per-object state in user data
 
-For objects where each instance needs its own data—for example tracking whether a surface has been configured:
+For objects where each instance needs its own data—for example tracking surface dimensions—use a custom user-data struct. Implement `Dispatch<WlSurface, SurfaceData>` on `AppState`, where `SurfaceData` is the user-data type:
 
 ```rust
 use wayland_client::{Dispatch, QueueHandle, Connection};
@@ -107,18 +108,21 @@ struct SurfaceData {
 
 struct AppState;
 
+// `&self` here is AppState; the user-data (`SurfaceData`) is accessed via
+// `Proxy::data::<SurfaceData>()` on the proxy, not through `&self`.
 impl Dispatch<wl_surface::WlSurface, SurfaceData> for AppState {
     fn event(
-        &mut self,
-        _proxy: &wl_surface::WlSurface,
+        &self,
+        _state: &mut AppState,
+        proxy: &wl_surface::WlSurface,
         event: wl_surface::Event,
-        data: &SurfaceData,   // immutable borrow of per-object state
         _conn: &Connection,
-        _qh: &QueueHandle<Self>,
+        _qh: &QueueHandle<AppState>,
     ) {
-        // wl_surface events rarely carry config info; the XDG layer does.
-        // But you can read `data` for per-object metadata.
-        let _ = data.width;
+        // Access per-object user data through the proxy
+        if let Some(data) = proxy.data::<SurfaceData>() {
+            let _ = data.width;
+        }
     }
 }
 ```
@@ -144,18 +148,18 @@ struct AppState {
     surfaces: HashMap<u32, SurfaceState>,
 }
 
-// Use u32 (the object's numeric ID) as user data
+// Use () as user data; look up per-object state in AppState by protocol ID
 impl Dispatch<wl_surface::WlSurface, ()> for AppState {
     fn event(
-        &mut self,
+        &self,
+        state: &mut AppState,
         proxy: &wl_surface::WlSurface,
         _event: wl_surface::Event,
-        _data: &(),
         _conn: &Connection,
-        _qh: &QueueHandle<Self>,
+        _qh: &QueueHandle<AppState>,
     ) {
-        // Look up per-object state by the object's ID
-        if let Some(s) = self.surfaces.get_mut(&proxy.id().protocol_id()) {
+        // Look up per-object state by the object's numeric protocol ID
+        if let Some(s) = state.surfaces.get_mut(&proxy.id().protocol_id()) {
             s.width = 800; // example
         }
     }
@@ -363,9 +367,10 @@ impl Dispatch<wl_keyboard::WlKeyboard, State> for GlobalData {
 If you are writing a library or toolkit (like Smithay's Client Toolkit) that provides reusable Wayland handling, make your `Dispatch` implementation generic over the downstream `State`:
 
 ```rust
-use wayland_client::{protocol::wl_registry, Dispatch, QueueHandle};
+use wayland_client::{protocol::wl_registry, Connection, Dispatch, QueueHandle};
 
 struct MyUserData;
+struct MyLibraryState;
 
 // Generic over the downstream state type
 impl<State> Dispatch<wl_registry::WlRegistry, State> for MyUserData
@@ -376,13 +381,14 @@ where
     fn event(
         &self,
         state: &mut State,
-        proxy: &wl_registry::WlRegistry,
-        event: wl_registry::Event,
-        conn: &wayland_client::Connection,
-        qhandle: &QueueHandle<State>,
+        _proxy: &wl_registry::WlRegistry,
+        _event: wl_registry::Event,
+        _conn: &Connection,
+        _qhandle: &QueueHandle<State>,
     ) {
         let lib_state: &mut MyLibraryState = state.as_mut();
         // process event using lib_state
+        let _ = lib_state;
     }
 }
 ```
@@ -398,17 +404,19 @@ Due to limitations in Rust's trait resolution, the type providing a generic `Dis
 A handful of Wayland events create new child objects as part of the event itself (in the core protocol, `wl_data_device.data_offer` is the canonical example). In these cases you must override `event_created_child` to provide the `ObjectData` for the newly created object. The `event_created_child!` macro makes this straightforward:
 
 ```rust
-use wayland_client::event_created_child;
+use wayland_client::{event_created_child, Connection, Dispatch, QueueHandle};
 use wayland_client::protocol::wl_data_device;
+
+struct AppState;
 
 impl Dispatch<wl_data_device::WlDataDevice, ()> for AppState {
     fn event(
-        &mut self,
+        &self,
+        _state: &mut AppState,
         _proxy: &wl_data_device::WlDataDevice,
-        event: wl_data_device::Event,
-        _data: &(),
+        _event: wl_data_device::Event,
         _conn: &Connection,
-        _qh: &QueueHandle<Self>,
+        _qh: &QueueHandle<AppState>,
     ) {
         // handle events
     }

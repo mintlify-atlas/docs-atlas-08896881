@@ -1,5 +1,5 @@
 ---
-title: "FFI and interoperability with C Wayland libraries"
+title: "FFI interop with C Wayland libraries using wayland-sys"
 sidebarTitle: "FFI & Interop"
 description: "Use wayland-sys and the system backend to interoperate with C Wayland code. Access raw wl_display, wl_proxy, and wl_resource pointers safely."
 ---
@@ -14,14 +14,18 @@ In most cases you should use the higher-level methods on `wayland_backend::sys::
 
 `wayland-sys` binds the four standard Wayland C libraries. Each is gated behind a Cargo feature of the same name:
 
-| Feature | Library | Module |
+| Feature | Library / Purpose | Module |
 |---|---|---|
 | `client` | `libwayland-client.so` | `wayland_sys::client` |
 | `server` | `libwayland-server.so` | `wayland_sys::server` |
-| `cursor` | `libwayland-cursor.so` | `wayland_sys::cursor` |
-| `egl` | `libwayland-egl.so` | `wayland_sys::egl` |
+| `cursor` | `libwayland-cursor.so` (implies `client`) | `wayland_sys::cursor` |
+| `egl` | `libwayland-egl.so` (implies `client`) | `wayland_sys::egl` |
+| `dlopen` | Load all libraries at runtime via `dlopen(3)` | — |
+| `libwayland_client_1_23` | Unlock APIs added in libwayland-client 1.23 | — |
+| `libwayland_server_1_22` | Unlock APIs added in libwayland-server 1.22 | — |
+| `libwayland_server_1_23` | Unlock APIs added in libwayland-server 1.23 (implies `libwayland_server_1_22`) | — |
 
-The `dlopen` feature changes all four from link-time symbols to runtime handles loaded via `dlopen(3)`.
+The `dlopen` feature changes all four library features from link-time symbols to runtime handles loaded via `dlopen(3)`.
 
 ```toml
 [dependencies.wayland-sys]

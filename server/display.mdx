@@ -8,7 +8,7 @@ Every `wayland-server` compositor revolves around two closely related types: `Di
 
 ## Creating a Display
 
-`Display::new()` is the only constructor. It can fail only when both the `server_system` and `dlopen` Cargo features are enabled and the `libwayland-server.so` library cannot be found at runtime.
+`Display::new()` is the only constructor. It can fail only when both the `system` and `dlopen` Cargo features of `wayland-server` are enabled (which activate the `server_system` and `dlopen` features of `wayland-backend` respectively) and the `libwayland-server.so` library cannot be found at runtime.
 
 ```rust
 use wayland_server::Display;
@@ -66,6 +66,10 @@ Forgetting to call `flush_clients()` means clients will never receive the events
 
 The canonical integration pattern is to:
 
+<Note>
+For calloop users, the [`calloop-wayland-source`](https://crates.io/crates/calloop-wayland-source) crate (a separate crate, not part of `wayland-server`) provides a purpose-built calloop event source that handles both dispatch and flush automatically. The manual `Generic` approach below also works when you prefer not to add the extra dependency.
+</Note>
+
 1. Poll the display file descriptor for readability.
 2. Poll the `ListeningSocket` file descriptor for new connections.
 3. Dispatch and flush inside the readable branch.
@@ -107,18 +111,20 @@ fn event_loop(
   <Tab title="With calloop">
 ```rust
 // calloop 0.14 example (popular choice in Smithay-based compositors)
-use calloop::{EventLoop, LoopHandle};
+// For a higher-level calloop integration, see the `calloop-wayland-source`
+// crate, which is a separate crate maintained alongside wayland-rs.
+use calloop::{EventLoop, Interest, LoopHandle, Mode};
+use calloop::generic::Generic;
 use wayland_server::Display;
 
 fn setup_event_loop(display: Display<State>) -> std::io::Result<()> {
     let mut event_loop: EventLoop<State> = EventLoop::try_new()?;
     let handle: LoopHandle<State> = event_loop.handle();
 
-    // Insert the display fd into calloop using its Generic source
-    use calloop::generic::Generic;
-    use calloop::Interest;
+    // Insert the display fd into calloop using its Generic source.
+    // Display implements AsFd, so Generic can poll it directly.
     handle.insert_source(
-        Generic::new(display, Interest::READ, calloop::Mode::Level),
+        Generic::new(display, Interest::READ, Mode::Level),
         |_, display, state| {
             display.dispatch_clients(state)?;
             Ok(calloop::PostAction::Continue)

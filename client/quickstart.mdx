@@ -28,7 +28,7 @@ wayland-client = "0.31"
 | Feature | Effect |
 |---------|--------|
 | `system` | Links against the system `libwayland-client.so`. Required for FFI interop with other C libraries (e.g. `raw-window-handle`). |
-| `dlopen` | Dynamically loads `libwayland-client.so` at runtime instead of linking at compile time. Your binary starts successfully even when no Wayland library is installed—useful for shipping cross-platform binaries that gracefully fall back when running under X11 or Windows. |
+| `dlopen` | Dynamically loads `libwayland-client.so` at runtime instead of linking at compile time. Your binary starts successfully even when no Wayland library is installed—useful for shipping cross-platform binaries that gracefully fall back when running under X11 or Windows. Must be combined with `system` to take effect. |
 
 To enable both:
 
@@ -79,21 +79,23 @@ The second argument to `get_registry` is the *user data* associated with this pa
 
 ### Implement `Dispatch` for `WlRegistry`
 
-For every Wayland object your application processes, you must implement `Dispatch<ObjectType, UserData>` for your state type. The `event()` method is called once per received event:
+For every Wayland object your application processes, you must implement `Dispatch<ObjectType, AppState>` for your user-data type. The `event()` method receives `&self` (the user data), `&mut State` (your application state), the proxy, the event, and handles for further object creation:
 
 ```rust
 use wayland_client::{protocol::wl_registry, Connection, Dispatch, QueueHandle};
 
 struct AppData;
 
-impl Dispatch<wl_registry::WlRegistry, ()> for AppData {
+// Dispatch<WlRegistry, AppData> is implemented for `()` — the user-data type
+// attached to the registry object. `AppData` is the application state.
+impl Dispatch<wl_registry::WlRegistry, AppData> for () {
     fn event(
-        &mut self,
-        _: &wl_registry::WlRegistry,
+        &self,
+        _state: &mut AppData,
+        _proxy: &wl_registry::WlRegistry,
         event: wl_registry::Event,
-        _: &(),
-        _: &Connection,
-        _: &QueueHandle<AppData>,
+        _conn: &Connection,
+        _qhandle: &QueueHandle<AppData>,
     ) {
         if let wl_registry::Event::Global { name, interface, version } = event {
             println!("[{name}] {interface} (v{version})");
@@ -103,7 +105,7 @@ impl Dispatch<wl_registry::WlRegistry, ()> for AppData {
 ```
 
 <Tip>
-The `Dispatch` trait's first type parameter is the proxy type (`WlRegistry`). The second is the user-data type you attached when the object was created—here `()`. You can have multiple `Dispatch` implementations for the same proxy type as long as the user-data types differ.
+`Dispatch<I, State>` is implemented on the **user-data type** (here `()`), not on `State`. The first type parameter is the proxy type (`WlRegistry`); the second is your application state type (`AppData`). You can have multiple `Dispatch` implementations for the same proxy type as long as the user-data types differ.
 </Tip>
 
 ### Call `roundtrip` to receive the initial events

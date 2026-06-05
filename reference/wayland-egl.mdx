@@ -1,7 +1,7 @@
 ---
 title: "wayland-egl API reference for EGL surface creation"
 sidebarTitle: "wayland-egl"
-description: "Reference for wayland-egl 0.32: WlEglSurface wraps wl_egl_window for OpenGL and Vulkan surface creation in Wayland clients."
+description: "Reference for wayland-egl 0.32.11: WlEglSurface wraps wl_egl_window for creating OpenGL and Vulkan rendering surfaces in Wayland clients."
 ---
 
 `wayland-egl` provides a safe Rust wrapper around `libwayland-egl`'s `wl_egl_window` type. A `WlEglSurface` is the bridge between a Wayland `wl_surface` and an EGL or Vulkan rendering context. Once created, you pass its raw pointer to your graphics library (e.g. `eglCreateWindowSurface`) to obtain a renderable surface.
@@ -115,7 +115,7 @@ Creating an EGL rendering surface for a Wayland client involves three layers:
 
 The typical flow is:
 
-```
+```text
 wl_surface (ObjectId)
     └─► WlEglSurface::new(id, w, h)
             └─► eglCreateWindowSurface(egl_display, config, wl_egl_surface.ptr(), ...)

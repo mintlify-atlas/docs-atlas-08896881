@@ -1,7 +1,7 @@
 ---
-title: "wayland-scanner proc-macro reference"
+title: "wayland-scanner: Protocol Code Generation Reference"
 sidebarTitle: "wayland-scanner"
-description: "Reference for wayland-scanner 0.31: generate_interfaces!, generate_client_code!, and generate_server_code! proc-macros for generating Rust from Wayland XML."
+description: "Reference for wayland-scanner 0.31.10: generate_interfaces!, generate_client_code!, and generate_server_code! proc-macros for Wayland XML."
 ---
 
 `wayland-scanner` is a procedural macro crate that reads Wayland XML protocol specification files and generates the corresponding Rust types, trait implementations, and interface metadata. It is the standard code-generation tool for custom Wayland protocol extensions in the wayland-rs ecosystem, producing code that integrates directly with `wayland-client`, `wayland-server`, and `wayland-backend`.
@@ -141,7 +141,7 @@ pub mod my_protocol {
 
 All three macros resolve paths relative to the `CARGO_MANIFEST_DIR` environment variable, which Cargo sets to the directory containing the `Cargo.toml` of the crate being compiled. This means a path like `"./protocols/my-extension.xml"` resolves to `<crate-root>/protocols/my-extension.xml`.
 
-```
+```text
 my-crate/
 ├── Cargo.toml
 ├── src/

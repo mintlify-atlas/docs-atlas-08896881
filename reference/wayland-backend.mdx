@@ -1,7 +1,7 @@
 ---
-title: "wayland-backend low-level API reference"
+title: "wayland-backend: Low-Level Wayland Protocol Backends"
 sidebarTitle: "wayland-backend"
-description: "Reference for wayland-backend 0.3: the low-level client and server protocol backends, ObjectData trait, and two backend implementations (rs and sys)."
+description: "Reference for wayland-backend 0.3.15: low-level client and server protocol backends, ObjectData trait, rs and sys backend implementations."
 ---
 
 `wayland-backend` is the foundational crate of the wayland-rs ecosystem. It provides low-level, unsafe-free APIs for driving both client and server sides of the Wayland protocol. Two interchangeable backend implementations are available: a pure-Rust backend (`rs`) and a system backend (`sys`) that delegates to the system-installed `libwayland` shared libraries. Higher-level crates such as `wayland-client` and `wayland-server` are built directly on top of this crate.
@@ -30,7 +30,7 @@ The following cargo features are available:
 | `libwayland_server_1_22` | Unlocks API available only in libwayland-server ≥ 1.22 (e.g. `global_name`). |
 | `libwayland_server_1_23` | Unlocks API available only in libwayland-server ≥ 1.23 (implies `libwayland_server_1_22`). |
 | `rwh_06` | Implements [`HasDisplayHandle`](https://docs.rs/raw-window-handle/0.6/raw_window_handle/trait.HasDisplayHandle.html) from `raw-window-handle 0.6` on the client `Backend` (requires `client_system`). |
-| `log` | Route internal diagnostic messages through the `log` crate instead of printing to stderr. |
+| `log` | Routes internal diagnostic messages through the [`log`](https://docs.rs/log) crate instead of printing to stderr. Activates via the `log` optional dependency. |
 
 <Tip>
 The `rwh_06` feature requires `client_system` to be active as well. Without `client_system` the `HasDisplayHandle` implementation is not generated.
@@ -38,7 +38,7 @@ The `rwh_06` feature requires `client_system` to be active as well. Without `cli
 
 ## Module layout
 
-```
+```text
 wayland_backend
 ├── rs             // Pure-Rust backend
 │   ├── client     // Client-side rs implementation
@@ -106,6 +106,7 @@ impl ObjectId {
 Implement this trait to receive events for objects you create. Every object managed by the backend must have an `Arc<dyn ObjectData>` associated with it.
 
 ```rust
+// AsAny is a private sealed supertrait; in practice, implement the three methods below.
 pub trait ObjectData: Any + Send + Sync {
     fn event(
         self: Arc<Self>,
@@ -115,10 +116,10 @@ pub trait ObjectData: Any + Send + Sync {
 
     fn destroyed(&self, object_id: ObjectId);
 
-    // Optional — defaults to "ObjectData { ... }"
+    /// Optional — defaults to printing "ObjectData { ... }"
     fn debug(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result;
 
-    // Optional — used to back Proxy::data() in wayland-client
+    /// Optional — used to back `Proxy::data()` in wayland-client; defaults to `self`
     fn data_as_any(&self) -> &dyn Any;
 }
 ```

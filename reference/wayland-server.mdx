@@ -1,7 +1,7 @@
 ---
-title: "wayland-server API reference"
+title: "wayland-server: Display, Resource, GlobalDispatch Reference"
 sidebarTitle: "wayland-server"
-description: "Complete API reference for wayland-server 0.31: Display, DisplayHandle, Resource, GlobalDispatch, Dispatch, Client, and ListeningSocket."
+description: "API reference for wayland-server 0.31.x: Display, DisplayHandle, Resource trait, GlobalDispatch, Dispatch, Client, and ListeningSocket."
 ---
 
 The `wayland-server` crate provides Rust bindings for implementing Wayland compositors. It is structured around four central abstractions: the [`Display<D>`](#display) that drives protocol processing for all connected clients, the [`DisplayHandle`](#displayhandle) through which you interact with the protocol state, resources implementing the [`Resource`](#the-resource-trait) trait that represent Wayland objects owned by clients, and the [`Dispatch`](#dispatch) / [`GlobalDispatch`](#globaldispatch) traits that connect protocol events to your compositor state.
@@ -25,6 +25,7 @@ wayland-server = "0.31"
 |---|---|
 | `system` | Link against the system-installed `libwayland-server.so` rather than using the built-in pure-Rust backend. Required for FFI interop (e.g. sharing a `wl_display*` with the graphics stack). |
 | `dlopen` | Load `libwayland-server.so` at runtime via `dlopen` instead of linking it at build time. Implies `system`. |
+| `log` | Route internal diagnostic messages through the [`log`](https://docs.rs/log) crate instead of printing directly to stderr. |
 | `libwayland_1_22` | Enable APIs that require libwayland ≥ 1.22 (e.g. `Client::global_name`). |
 | `libwayland_1_23` | Enable APIs that require libwayland ≥ 1.23 (e.g. `DisplayHandle::set_default_max_buffer_size`, `Client::set_max_buffer_size`). Implies `libwayland_1_22`. |
 

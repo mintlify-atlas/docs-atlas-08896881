@@ -133,8 +133,13 @@ loop {
     // 2. Drain any events already buffered by other threads
     event_queue.dispatch_pending(&mut state).unwrap();
 
-    // 3. Prepare for a coordinated socket read
-    let read_guard = event_queue.prepare_read().unwrap();
+    // 3. Prepare for a coordinated socket read.
+    // Returns None when events are already internally queued (e.g. read by
+    // another thread); in that case dispatch_pending above already handled them.
+    let read_guard = match event_queue.prepare_read() {
+        Some(guard) => guard,
+        None => continue,
+    };
 
     // 4. Poll or epoll on read_guard.connection_fd() alongside your other fds
     let wayland_ready = poll_fd(read_guard.connection_fd());
@@ -152,7 +157,7 @@ loop {
 ```
 
 <Note>
-`prepare_read()` returns `None` if events are already queued internally (for example because another thread read from the socket). In that case, call `dispatch_pending()` immediately and try `prepare_read()` again on the next iteration.
+`prepare_read()` returns `None` when events are already queued in the internal buffer (for example because another thread read from the socket). The example above handles this by calling `continue` and looping back to `dispatch_pending()`.
 </Note>
 
 `ReadEventsGuard` is re-exported from `wayland_client::backend`:

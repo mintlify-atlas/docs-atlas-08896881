@@ -1,5 +1,5 @@
 ---
-title: "OpenGL and EGL integration with wayland-egl"
+title: "EGL surface creation and OpenGL integration with wayland-egl"
 sidebarTitle: "EGL Integration"
 description: "wayland-egl wraps wl_egl_window to create EGL surfaces from Wayland WlSurface objects, enabling OpenGL and Vulkan rendering in clients."
 ---
@@ -99,12 +99,18 @@ println!("Current EGL surface size: {w}×{h}");
 
 ## `raw-window-handle` integration
 
-`wayland-backend` implements [`HasDisplayHandle`][rwh_06::HasDisplayHandle] for `client::Backend` when both the `rwh_06` and `client_system` features are enabled. This lets you pass the display handle to crates such as `wgpu` or `winit` through the standard `raw-window-handle` API.
+`wayland-backend` implements [`HasDisplayHandle`][rwh_06::HasDisplayHandle] for `client::Backend` when both the `rwh_06` and `client_system` features are enabled on `wayland-backend` (not on `wayland-egl`). This lets you pass the display handle to crates such as `wgpu` or `winit` through the standard `raw-window-handle` API.
 
-To obtain a `RawWindowHandle` for the surface side you construct a `WaylandWindowHandle` from the `wl_egl_window` pointer:
+To obtain a `RawWindowHandle` for the surface side you construct a `WaylandWindowHandle` from the `wl_egl_window` pointer. Add `wayland-backend` with `rwh_06` explicitly:
+
+```toml
+[dependencies]
+wayland-egl = "0.32"
+wayland-backend = { version = "0.3", features = ["client_system", "rwh_06"] }
+raw-window-handle = "0.6"
+```
 
 ```rust
-#[cfg(feature = "rwh_06")]
 fn window_handle(egl_surface: &WlEglSurface) -> raw_window_handle::RawWindowHandle {
     use raw_window_handle::{RawWindowHandle, WaylandWindowHandle};
     use std::ptr::NonNull;

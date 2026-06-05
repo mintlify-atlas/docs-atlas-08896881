@@ -1,7 +1,7 @@
 ---
 title: "wayland-cursor API reference for cursor theme loading"
 sidebarTitle: "wayland-cursor"
-description: "Reference for wayland-cursor 0.31: CursorTheme, Cursor, and CursorImageBuffer types for loading XCursor images from system themes."
+description: "Reference for wayland-cursor 0.31.14: CursorTheme, Cursor, and CursorImageBuffer types for loading and animating XCursor images from system themes."
 ---
 
 `wayland-cursor` provides a pure-Rust re-implementation of the `libwayland-cursor` functionality. It reads XCursor theme files from the system, selects the appropriate image size, uploads cursor pixel data into a Wayland shared-memory pool, and exposes `WlBuffer` handles you can attach directly to a `wl_surface`. Animated cursors are fully supported via a frame-timing API.
